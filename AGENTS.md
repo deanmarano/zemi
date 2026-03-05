@@ -103,7 +103,7 @@ Replication slot and WAL stream management.
 - `ensurePublication()` — creates publication via a separate non-replication connection
 - Key detail: `messages 'true'` in START_REPLICATION options is required for `_bemi` context messages to be forwarded via pgoutput.
 
-**`src/decoder.zig`** (~1,488 lines, 18 tests)
+**`src/decoder.zig`** (~1,600 lines, 20 tests)
 pgoutput logical decoding message parser and transaction state machine.
 - `PgOutputMessageType` — enum for all 10 pgoutput message types (Begin, Commit, Relation, Insert, Update, Delete, Truncate, Origin, Type, Message)
 - `RelationCache` — caches relation metadata (column definitions) keyed by relation_id; owns all string data (duped from parse buffers)
@@ -158,14 +158,14 @@ Application entry point and orchestration.
 
 ## Testing
 
-### Unit Tests (48 tests)
+### Unit Tests (54 tests)
 
 Run with `zig build test`. All tests are pulled in via `src/main.zig`'s test block which `@import`s all modules. Tests are in-file (Zig convention).
 
 | File | Tests | What's Tested |
 |------|-------|---------------|
 | protocol.zig | 9 | MessageReader, message builders, MD5 auth, LSN parse/format, replication message parsing |
-| decoder.zig | 18 | All 10 pgoutput message types, RelationCache, full transaction decode, primary key extraction, context stitching (4 scenarios) |
+| decoder.zig | 20 | All 10 pgoutput message types, RelationCache, full transaction decode (INSERT + TRUNCATE), primary key extraction, context stitching (4 scenarios + TRUNCATE) |
 | storage.zig | 10 | SQL building, escaping, JSON serialization, timestamp conversion, error classification |
 | scram.zig | 5 | Full SCRAM exchange, nonce mismatch, signature verification, SASL message formats |
 | config.zig | 7 | Table filtering, whitespace trimming, validation, SSL mode parsing, dest SSL fallback |
@@ -173,14 +173,14 @@ Run with `zig build test`. All tests are pulled in via `src/main.zig`'s test blo
 
 **Important**: Zig's test runner treats `log.err` calls as test failures. Error-path tests must use `log.warn` instead.
 
-### E2E Integration Tests (25 assertions, 10 test groups)
+### E2E Integration Tests (29 assertions, 11 test groups)
 
 Run with `./test/e2e.sh` (uses Docker Compose) or `./test/e2e.sh --no-docker` (expects PostgreSQL already running on ports 5433, 5434, and 5435).
 
 The test script:
 1. Starts three PostgreSQL 16 instances: MD5 (port 5433), SCRAM-SHA-256 (port 5434), and SSL-enabled (port 5435)
 2. Builds Zemi from source
-3. Runs 10 test groups covering: connection, INSERT/UPDATE/DELETE tracking, data correctness, table filtering, context stitching, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca)
+3. Runs 11 test groups covering: connection, INSERT/UPDATE/DELETE/TRUNCATE tracking, data correctness, table filtering, context stitching, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca)
 4. Each test starts Zemi as a background process, performs SQL operations, waits, then queries the `changes` table
 
 **`docker-compose.test.yml`** — three PostgreSQL 16 Alpine services:
@@ -308,13 +308,12 @@ The `core/` and `worker/` directories contain the original TypeScript/Node.js co
 - SCRAM-SHA-256 authentication (`src/scram.zig` + `src/connection.zig` updates)
 - SSL/TLS support (`src/connection.zig` — SSLRequest negotiation, TLS handshake, TLS-aware I/O wrappers)
 - SSL configuration (`src/config.zig` — `SslMode` enum, `DB_SSL_MODE`, `DB_SSL_ROOT_CERT`, dest fallbacks)
-- E2E integration tests (25 assertions across 10 test groups including SCRAM and SSL)
+- E2E integration tests (29 assertions across 11 test groups including SCRAM and SSL)
 - Full CI pipeline with cross-compilation, E2E (MD5 + SCRAM + SSL), Docker, and release automation
 - Docusaurus documentation (5 Zemi pages + updated site config)
 - Rename from Bemi to Zemi throughout
 
 ### Potential Future Work
-- **TRUNCATE tracking verification** — pgoutput truncate messages are parsed but not E2E tested
 - **Observability/metrics** — Prometheus endpoint for monitoring
 - **Graceful slot/publication cleanup on shutdown**
 - **Connection pooling for storage** — currently single connection

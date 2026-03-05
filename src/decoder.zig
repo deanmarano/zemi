@@ -883,6 +883,27 @@ fn buildTestInsertMsg(allocator: std.mem.Allocator, rel_id: u32) ![]u8 {
     return try w.toOwnedSlice();
 }
 
+fn buildTestTruncateMsg(allocator: std.mem.Allocator, rel_ids: []const u32, option_bits: u8) ![]u8 {
+    var w = protocol.MessageWriter.init(allocator);
+    defer w.deinit();
+
+    try w.writeByte('T'); // message type
+    // num_relations
+    var num_buf: [4]u8 = undefined;
+    mem.writeInt(u32, &num_buf, @intCast(rel_ids.len), .big);
+    try w.writeBytes(&num_buf);
+    // option_bits
+    try w.writeByte(option_bits);
+    // relation IDs
+    for (rel_ids) |rid| {
+        var rid_buf: [4]u8 = undefined;
+        mem.writeInt(u32, &rid_buf, rid, .big);
+        try w.writeBytes(&rid_buf);
+    }
+
+    return try w.toOwnedSlice();
+}
+
 test "parse Begin message" {
     const data = blk: {
         var buf: [21]u8 = undefined;
@@ -1480,6 +1501,95 @@ test "context stitching: multiple changes in same transaction share context" {
     try std.testing.expectEqualStrings(context_json, changes.?[0].context.?);
     try std.testing.expect(changes.?[1].context != null);
     try std.testing.expectEqualStrings(context_json, changes.?[1].context.?);
+
+    for (changes.?) |*c| {
+        c.deinit(allocator);
+    }
+    allocator.free(changes.?);
+}
+
+test "Decoder full transaction: Begin, Relation, Truncate, Commit" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator, "testdb");
+    defer dec.deinit();
+
+    // 1. Begin
+    const begin_data = buildTestBeginData(20);
+    const begin_result = try dec.decode(&begin_data, 900);
+    try std.testing.expect(begin_result == null);
+    try std.testing.expect(dec.in_transaction);
+
+    // 2. Relation (relation_id = 16384, "public.users")
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    const rel_result = try dec.decode(rel_data, 950);
+    try std.testing.expect(rel_result == null);
+
+    // 3. Truncate (single table)
+    const trunc_data = try buildTestTruncateMsg(allocator, &[_]u32{16384}, 0);
+    defer allocator.free(trunc_data);
+    const trunc_result = try dec.decode(trunc_data, 960);
+    try std.testing.expect(trunc_result == null);
+
+    // 4. Commit
+    const commit_data = buildTestCommitData();
+    const changes = try dec.decode(&commit_data, 1000);
+    try std.testing.expect(changes != null);
+    try std.testing.expectEqual(@as(usize, 1), changes.?.len);
+
+    const change = changes.?[0];
+    try std.testing.expectEqual(Operation.TRUNCATE, change.operation);
+    try std.testing.expectEqualStrings("testdb", change.database);
+    try std.testing.expectEqualStrings("public", change.schema);
+    try std.testing.expectEqualStrings("users", change.table);
+    try std.testing.expectEqualStrings("", change.primary_key);
+    try std.testing.expect(change.before == null);
+    try std.testing.expect(change.after == null);
+    try std.testing.expectEqual(@as(u32, 20), change.transaction_id);
+    try std.testing.expect(!dec.in_transaction);
+    try std.testing.expect(change.context == null);
+
+    for (changes.?) |*c| {
+        c.deinit(allocator);
+    }
+    allocator.free(changes.?);
+}
+
+test "Decoder TRUNCATE with context stitching" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator, "testdb");
+    defer dec.deinit();
+
+    // 1. Begin
+    const begin_data = buildTestBeginData(21);
+    _ = try dec.decode(&begin_data, 900);
+
+    // 2. Relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    // 3. _bemi context message
+    const context_json = "{\"user_id\": \"456\", \"reason\": \"cleanup\"}";
+    const bemi_msg = try buildTestBemiMessage(allocator, "_bemi", context_json, true);
+    defer allocator.free(bemi_msg);
+    _ = try dec.decode(bemi_msg, 920);
+
+    // 4. Truncate
+    const trunc_data = try buildTestTruncateMsg(allocator, &[_]u32{16384}, 0);
+    defer allocator.free(trunc_data);
+    _ = try dec.decode(trunc_data, 930);
+
+    // 5. Commit
+    const commit_data = buildTestCommitData();
+    const changes = try dec.decode(&commit_data, 1000);
+    try std.testing.expect(changes != null);
+    try std.testing.expectEqual(@as(usize, 1), changes.?.len);
+
+    const change = changes.?[0];
+    try std.testing.expectEqual(Operation.TRUNCATE, change.operation);
+    try std.testing.expect(change.context != null);
+    try std.testing.expectEqualStrings(context_json, change.context.?);
 
     for (changes.?) |*c| {
         c.deinit(allocator);

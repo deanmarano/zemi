@@ -337,10 +337,33 @@ CHANGES_COUNT_2=$(query "SELECT COUNT(*) FROM changes;")
 assert_eq "changes table doesn't trigger recursive tracking" "$CHANGES_COUNT_1" "$CHANGES_COUNT_2"
 
 # ---------------------------------------------------------------------------
-# Test 9: SCRAM-SHA-256 authentication
+# Test 9: TRUNCATE tracking
 # ---------------------------------------------------------------------------
 echo ""
-echo "$(bold "[Test 9] SCRAM-SHA-256 authentication")"
+echo "$(bold "[Test 9] TRUNCATE tracking")"
+
+CHANGES_BEFORE_TRUNC=$(query "SELECT COUNT(*) FROM changes;")
+
+query "TRUNCATE test_users CASCADE;"
+wait_for_changes $((CHANGES_BEFORE_TRUNC + 1))
+
+TRUNC_OP=$(query "SELECT operation FROM changes WHERE operation = 'TRUNCATE' AND \"table\" = 'test_users' LIMIT 1;")
+assert_eq "TRUNCATE creates a TRUNCATE change" "TRUNCATE" "$TRUNC_OP"
+
+TRUNC_BEFORE=$(query "SELECT before FROM changes WHERE operation = 'TRUNCATE' AND \"table\" = 'test_users' LIMIT 1;")
+assert_eq "before is empty for TRUNCATE" "{}" "$TRUNC_BEFORE"
+
+TRUNC_AFTER=$(query "SELECT after FROM changes WHERE operation = 'TRUNCATE' AND \"table\" = 'test_users' LIMIT 1;")
+assert_eq "after is empty for TRUNCATE" "{}" "$TRUNC_AFTER"
+
+TRUNC_PK=$(query "SELECT primary_key FROM changes WHERE operation = 'TRUNCATE' AND \"table\" = 'test_users' LIMIT 1;")
+assert_eq "primary_key is empty for TRUNCATE" "" "$TRUNC_PK"
+
+# ---------------------------------------------------------------------------
+# Test 10: SCRAM-SHA-256 authentication
+# ---------------------------------------------------------------------------
+echo ""
+echo "$(bold "[Test 10] SCRAM-SHA-256 authentication")"
 
 SCRAM_PORT="${SCRAM_PORT:-5434}"
 SCRAM_PSQL="psql -h $DB_HOST -p $SCRAM_PORT -U $DB_USER -d $DB_NAME -X -q"
@@ -422,10 +445,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 10: SSL/TLS connection (sslmode=require)
+# Test 11: SSL/TLS connection (sslmode=require)
 # ---------------------------------------------------------------------------
 echo ""
-echo "$(bold "[Test 10] SSL/TLS connection")"
+echo "$(bold "[Test 11] SSL/TLS connection")"
 
 SSL_PORT="${SSL_PORT:-5435}"
 SSL_PSQL="psql -h $DB_HOST -p $SSL_PORT -U $DB_USER -d $DB_NAME -X -q"
@@ -469,8 +492,8 @@ if [ "$SSL_AVAILABLE" = true ]; then
         ssl_query "CREATE TABLE ssl_test_items (id SERIAL PRIMARY KEY, name TEXT NOT NULL);"
         ssl_query "CREATE PUBLICATION zemi_ssl_pub FOR TABLE ssl_test_items;"
 
-        # --- Test 10a: sslmode=require (no cert verification) ---
-        echo "  $(bold "10a: sslmode=require")"
+        # --- Test 11a: sslmode=require (no cert verification) ---
+        echo "  $(bold "11a: sslmode=require")"
 
         DB_PORT="$SSL_PORT" \
         DB_SSL_MODE="require" \
@@ -515,8 +538,8 @@ if [ "$SSL_AVAILABLE" = true ]; then
         fi
         SSL_ZEMI_PID=""
 
-        # --- Test 10b: sslmode=verify-ca with root cert ---
-        echo "  $(bold "10b: sslmode=verify-ca")"
+        # --- Test 11b: sslmode=verify-ca with root cert ---
+        echo "  $(bold "11b: sslmode=verify-ca")"
 
         # Extract the CA certificate from the SSL container
         SSL_CERT_DIR="/tmp/zemi-ssl-certs"
@@ -528,7 +551,7 @@ if [ "$SSL_AVAILABLE" = true ]; then
         fi
 
         if [ -f "$SSL_CERT_DIR/root.crt" ]; then
-            # Clean up changes from 10a
+            # Clean up changes from 11a
             ssl_query "DELETE FROM changes;"
             ssl_query "DELETE FROM ssl_test_items;"
 

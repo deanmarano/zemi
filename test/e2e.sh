@@ -49,9 +49,13 @@ cleanup() {
     fi
     # Drop replication slot and publication (best effort)
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "SELECT pg_drop_replication_slot('$SLOT_NAME');" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SELECT pg_drop_replication_slot('zemi_filter_test');" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $PUBLICATION_NAME;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS zemi_filter_pub;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS test_users CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS test_orders CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_tracked CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_ignored CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
     # Clean up SSL test temp files
     rm -rf /tmp/zemi-ssl-certs 2>/dev/null || true
@@ -600,6 +604,7 @@ ssl_cleanup() {
     fi
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SELECT pg_drop_replication_slot('zemi_ssl_test');" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SELECT pg_drop_replication_slot('zemi_ssl_verify');" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SELECT pg_drop_replication_slot('zemi_ssl_full');" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP PUBLICATION IF EXISTS zemi_ssl_pub;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP TABLE IF EXISTS ssl_test_items CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
@@ -730,6 +735,60 @@ if [ "$SSL_AVAILABLE" = true ]; then
                 TOTAL=$((TOTAL + 2))
             fi
 
+            # --- Test 13c: sslmode=verify-full with hostname verification ---
+            echo "  $(bold "13c: sslmode=verify-full")"
+
+            # Stop previous Zemi instance if still running
+            if [ -n "$SSL_ZEMI_PID" ] && kill -0 "$SSL_ZEMI_PID" 2>/dev/null; then
+                kill "$SSL_ZEMI_PID" 2>/dev/null || true
+                wait "$SSL_ZEMI_PID" 2>/dev/null || true
+            fi
+            SSL_ZEMI_PID=""
+
+            # Drop the verify-ca slot before starting verify-full
+            sleep 1
+            PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SELECT pg_drop_replication_slot('zemi_ssl_verify');" 2>/dev/null || true
+
+            # Clean up changes from 13b
+            ssl_query "DELETE FROM changes;" 2>/dev/null || true
+            ssl_query "DELETE FROM ssl_test_items;" 2>/dev/null || true
+
+            # verify-full checks that the server certificate hostname matches DB_HOST.
+            # Our test cert has SAN IP:127.0.0.1, so we connect via 127.0.0.1.
+            DB_HOST="127.0.0.1" \
+            DB_PORT="$SSL_PORT" \
+            DB_SSL_MODE="verify-full" \
+            DB_SSL_ROOT_CERT="$SSL_CERT_DIR/root.crt" \
+            SLOT_NAME="zemi_ssl_full" \
+            PUBLICATION_NAME="zemi_ssl_pub" \
+            "$ZEMI_BIN" > /tmp/zemi-e2e-ssl-full.log 2>&1 &
+            SSL_ZEMI_PID=$!
+
+            sleep 3
+
+            if kill -0 "$SSL_ZEMI_PID" 2>/dev/null; then
+                assert_eq "Zemi connects with SSL (verify-full)" "running" "running"
+
+                ssl_query "INSERT INTO ssl_test_items (name) VALUES ('ssl-verify-full-item');"
+
+                SSL_ELAPSED=0
+                while [ "$SSL_ELAPSED" -lt 15 ]; do
+                    SSL_COUNT=$(ssl_query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'ssl_test_items' AND operation = 'CREATE' AND after->>'name' = 'ssl-verify-full-item';" 2>/dev/null || echo "0")
+                    if [ "$SSL_COUNT" -ge 1 ]; then break; fi
+                    sleep 1
+                    SSL_ELAPSED=$((SSL_ELAPSED + 1))
+                done
+
+                SSL_FULL_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' AND after->>'name' = 'ssl-verify-full-item' LIMIT 1;" || echo "")
+                assert_eq "SSL verify-full: INSERT tracked" "CREATE" "$SSL_FULL_OP"
+            else
+                echo "  $(red "FAIL") Zemi failed to start with SSL (verify-full)"
+                echo "  --- SSL verify-full Zemi logs:"
+                cat /tmp/zemi-e2e-ssl-full.log
+                FAIL=$((FAIL + 2))
+                TOTAL=$((TOTAL + 2))
+            fi
+
             rm -rf "$SSL_CERT_DIR"
         else
             echo "  SKIP: Could not extract root certificate (--no-docker without cert path)"
@@ -740,6 +799,80 @@ if [ "$SSL_AVAILABLE" = true ]; then
 else
     echo "  SKIP: SSL PostgreSQL not available on port $SSL_PORT"
 fi
+
+# ---------------------------------------------------------------------------
+# Test 14: Table filtering (TABLES env var)
+# ---------------------------------------------------------------------------
+echo ""
+echo "$(bold "[Test 14] Table filtering (TABLES env var)")"
+
+FILTER_SLOT="zemi_filter_test"
+FILTER_PUB="zemi_filter_pub"
+FILTER_ZEMI_PID=""
+
+filter_cleanup() {
+    if [ -n "$FILTER_ZEMI_PID" ] && kill -0 "$FILTER_ZEMI_PID" 2>/dev/null; then
+        kill "$FILTER_ZEMI_PID" 2>/dev/null || true
+        wait "$FILTER_ZEMI_PID" 2>/dev/null || true
+    fi
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SELECT pg_drop_replication_slot('$FILTER_SLOT');" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $FILTER_PUB;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_tracked CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_ignored CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
+}
+
+# Clean up any previous state
+filter_cleanup
+
+# Create test tables — both are in the publication, but TABLES will restrict tracking
+query "CREATE TABLE filter_tracked (id SERIAL PRIMARY KEY, name TEXT NOT NULL);"
+query "CREATE TABLE filter_ignored (id SERIAL PRIMARY KEY, name TEXT NOT NULL);"
+query "CREATE PUBLICATION $FILTER_PUB FOR TABLE filter_tracked, filter_ignored;"
+
+# Start Zemi with TABLES=filter_tracked (only track one table)
+TABLES="filter_tracked" \
+SLOT_NAME="$FILTER_SLOT" \
+PUBLICATION_NAME="$FILTER_PUB" \
+"$ZEMI_BIN" > /tmp/zemi-e2e-filter.log 2>&1 &
+FILTER_ZEMI_PID=$!
+
+sleep 3
+
+if kill -0 "$FILTER_ZEMI_PID" 2>/dev/null; then
+    # Insert into both tables
+    query "INSERT INTO filter_tracked (name) VALUES ('should-appear');"
+    query "INSERT INTO filter_ignored (name) VALUES ('should-not-appear');"
+
+    # Wait for the tracked change to appear
+    FILTER_ELAPSED=0
+    while [ "$FILTER_ELAPSED" -lt 15 ]; do
+        FILTER_COUNT=$(query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'filter_tracked';" 2>/dev/null || echo "0")
+        if [ "$FILTER_COUNT" -ge 1 ]; then break; fi
+        sleep 1
+        FILTER_ELAPSED=$((FILTER_ELAPSED + 1))
+    done
+
+    # Give a bit more time to ensure the ignored table's change would have appeared if not filtered
+    sleep 2
+
+    TRACKED_COUNT=$(query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'filter_tracked';")
+    assert_eq "filter: tracked table changes recorded" "1" "$TRACKED_COUNT"
+
+    IGNORED_COUNT=$(query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'filter_ignored';")
+    assert_eq "filter: ignored table changes excluded" "0" "$IGNORED_COUNT"
+
+    TRACKED_NAME=$(query "SELECT after->>'name' FROM changes WHERE \"table\" = 'filter_tracked' LIMIT 1;")
+    assert_eq "filter: tracked data correct" "should-appear" "$TRACKED_NAME"
+else
+    echo "  $(red "FAIL") Zemi failed to start for table filtering test"
+    echo "  --- Filter Zemi logs:"
+    cat /tmp/zemi-e2e-filter.log
+    FAIL=$((FAIL + 3))
+    TOTAL=$((TOTAL + 3))
+fi
+
+filter_cleanup
 
 # ===========================================================================
 # RESULTS

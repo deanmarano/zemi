@@ -99,6 +99,7 @@ pub const Connection = struct {
         if (ssl_mode != .disable) {
             conn.negotiateSsl(ssl_mode, ssl_root_cert) catch |err| {
                 log.err("SSL negotiation failed: {}", .{err});
+                conn.server_params.deinit();
                 conn.stream.close();
                 return err;
             };
@@ -106,6 +107,7 @@ pub const Connection = struct {
 
         conn.performStartup() catch |err| {
             if (conn.ca_bundle) |*bundle| bundle.deinit(allocator);
+            conn.server_params.deinit();
             conn.stream.close();
             return err;
         };
@@ -117,12 +119,14 @@ pub const Connection = struct {
         // Send Terminate message
         const term_msg = protocol.buildTerminateMessage(self.allocator) catch {
             if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
+            self.server_params.deinit();
             self.stream.close();
             return;
         };
         defer self.allocator.free(term_msg);
         self.tlsWriteAll(term_msg) catch {};
         if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
+        self.server_params.deinit();
         self.stream.close();
     }
 

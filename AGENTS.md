@@ -39,6 +39,7 @@ Internally, Zemi is a pipeline:
 │ connection   │───>│ replication   │───>│ decoder  │───>│ storage   │───>│ health   │
 │ + protocol   │    │ (WAL stream)  │    │ (pgoutput│    │ (changes  │    │ (HTTP    │
 │ + scram      │    │               │    │  parser) │    │  table)   │    │  server) │
+│ + tls        │    │               │    │          │    │           │    │          │
 └─────────────┘    └──────────────┘    └─────────┘    └──────────┘    └─────────┘
         │                                                                    │
         └──────────────── config ────────────────────────────────────────────┘
@@ -46,13 +47,13 @@ Internally, Zemi is a pipeline:
 
 ## Source Files
 
-All Zig source lives in `src/`. The codebase is ~4,500 lines with 48 unit tests.
+All Zig source lives in `src/`. The codebase is ~5,000 lines with 50+ unit tests.
 
 ### Dependency Layers
 
 ```
 Layer 0 (no src/ deps):  protocol.zig, scram.zig, config.zig, health.zig
-Layer 1:                 connection.zig  (protocol + scram)
+Layer 1:                 connection.zig  (protocol + scram + config + tls)
 Layer 2:                 decoder.zig     (protocol)
                          replication.zig (protocol + connection + config)
                          storage.zig     (connection + config + decoder + protocol)
@@ -71,14 +72,18 @@ PostgreSQL v3 wire protocol implementation. All the low-level message parsing an
 - Free functions: `buildStartupMessage`, `buildQueryMessage`, `computeMd5Password`, `parseErrorFields`, `parseDataRow`, `parseReplicationMessage`, `buildStandbyStatusUpdate`, `parseLsn`, `formatLsn`, `pgEpochMicroseconds`
 - Key detail: PostgreSQL uses big-endian byte order and a PG epoch of 2000-01-01 (not Unix epoch). The offset is `946_684_800_000_000` microseconds.
 
-**`src/connection.zig`** (~456 lines, 0 tests)
-TCP connection management with the full startup/authentication handshake.
-- `Connection` struct — holds TCP stream, 64KB read buffer, server params, optional `ScramClient` state
-- `connect()` — opens TCP, sends startup message, handles auth (MD5 or SCRAM-SHA-256), processes ParameterStatus/BackendKeyData until ReadyForQuery
+**`src/connection.zig`** (~600 lines, 0 tests)
+TCP connection management with SSL/TLS negotiation and the full startup/authentication handshake.
+- `Connection` struct — holds TCP stream, 64KB read buffer, server params, optional `ScramClient` state, optional `tls.Client` and `Certificate.Bundle` for SSL
+- `connect()` — opens TCP, optionally negotiates SSL (SSLRequest → TLS handshake), sends startup message, handles auth (MD5 or SCRAM-SHA-256), processes ParameterStatus/BackendKeyData until ReadyForQuery
+- `negotiateSsl()` — sends PostgreSQL SSLRequest message, reads server response byte (`'S'` = SSL ok, `'N'` = refused)
+- `performTlsHandshake()` — loads CA bundle (system or custom via `ssl_root_cert`), initializes `tls.Client` with appropriate verification options
+- `tlsRead()` / `tlsWriteAll()` — TLS-aware I/O wrappers that transparently handle encrypted/unencrypted connections; maps TLS-specific errors to stream-level errors
 - `query()` / `exec()` — simple query protocol (sends SQL, reads until ReadyForQuery)
 - `readMessage()` — reads one raw backend message with buffer management
 - `readCopyData()` — reads CopyData for replication streaming
-- Key detail: Uses a 64KB stack-allocated read buffer with compact-on-refill. `CopyBothResponse` triggers early return from `query()` to enter replication streaming mode.
+- `close()` — cleans up TLS client and CA bundle if present
+- Key detail: Uses a 64KB stack-allocated read buffer with compact-on-refill. `CopyBothResponse` triggers early return from `query()` to enter replication streaming mode. SSL negotiation happens before the startup message per PostgreSQL protocol spec. The `tls.Client` is ~16KB due to its internal cipher buffer. `allow_truncation_attacks` is set to `true` because PostgreSQL doesn't always send TLS `close_notify`.
 
 **`src/scram.zig`** (~417 lines, 5 tests)
 SCRAM-SHA-256 authentication (RFC 5802) for PostgreSQL 14+.
@@ -117,10 +122,12 @@ Change persistence to PostgreSQL with schema migration and retry logic.
 - The `changes` table schema has 14 columns including UUID PK, JSONB before/after/context, GIN indexes, and a unique constraint on (position, table, schema, database, operation) for deduplication.
 - Key detail: The `changes` table itself must be filtered from tracking (in `main.zig`) to prevent infinite recursive WAL events.
 
-**`src/config.zig`** (~224 lines, 4 tests)
+**`src/config.zig`** (~280 lines, 7 tests)
 Environment variable configuration.
+- `SslMode` enum — `disable`, `require`, `verify_ca`, `verify_full` with `fromString()`/`toString()` conversion
 - `Config` struct — all settings with defaults. Slot and publication names default to `"zemi"`.
-- `fromEnv()` — reads 16 environment variables (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, SLOT_NAME, PUBLICATION_NAME, DEST_DB_*, LOG_LEVEL, TABLES, SHUTDOWN_TIMEOUT, HEALTH_PORT)
+- `fromEnv()` — reads 20 environment variables (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DB_SSL_MODE, DB_SSL_ROOT_CERT, SLOT_NAME, PUBLICATION_NAME, DEST_DB_*, LOG_LEVEL, TABLES, SHUTDOWN_TIMEOUT, HEALTH_PORT)
+- `getDestSslMode()` / `getDestSslRootCert()` — destination SSL settings with fallback to source DB settings
 - `shouldTrackTable()` — comma-separated table filter with whitespace trimming
 - `validate()` — returns first validation error message or null
 - Destination DB fields (`DEST_DB_*`) fall back to source DB fields when unset.
@@ -161,24 +168,25 @@ Run with `zig build test`. All tests are pulled in via `src/main.zig`'s test blo
 | decoder.zig | 18 | All 10 pgoutput message types, RelationCache, full transaction decode, primary key extraction, context stitching (4 scenarios) |
 | storage.zig | 10 | SQL building, escaping, JSON serialization, timestamp conversion, error classification |
 | scram.zig | 5 | Full SCRAM exchange, nonce mismatch, signature verification, SASL message formats |
-| config.zig | 4 | Table filtering, whitespace trimming, validation |
+| config.zig | 7 | Table filtering, whitespace trimming, validation, SSL mode parsing, dest SSL fallback |
 | health.zig | 1 | HTTP response format |
 
 **Important**: Zig's test runner treats `log.err` calls as test failures. Error-path tests must use `log.warn` instead.
 
-### E2E Integration Tests (19 assertions, 9 test groups)
+### E2E Integration Tests (25 assertions, 10 test groups)
 
-Run with `./test/e2e.sh` (uses Docker Compose) or `./test/e2e.sh --no-docker` (expects PostgreSQL already running on ports 5433 and 5434).
+Run with `./test/e2e.sh` (uses Docker Compose) or `./test/e2e.sh --no-docker` (expects PostgreSQL already running on ports 5433, 5434, and 5435).
 
 The test script:
-1. Starts two PostgreSQL 16 instances: MD5 (port 5433) and SCRAM-SHA-256 (port 5434)
+1. Starts three PostgreSQL 16 instances: MD5 (port 5433), SCRAM-SHA-256 (port 5434), and SSL-enabled (port 5435)
 2. Builds Zemi from source
-3. Runs 9 test groups covering: connection, INSERT/UPDATE/DELETE tracking, data correctness, table filtering, context stitching, SCRAM-SHA-256 auth
+3. Runs 10 test groups covering: connection, INSERT/UPDATE/DELETE tracking, data correctness, table filtering, context stitching, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca)
 4. Each test starts Zemi as a background process, performs SQL operations, waits, then queries the `changes` table
 
-**`docker-compose.test.yml`** — two PostgreSQL 16 Alpine services:
+**`docker-compose.test.yml`** — three PostgreSQL 16 Alpine services:
 - `postgres` on port 5433 with MD5 auth, `wal_level=logical`
 - `postgres-scram` on port 5434 with SCRAM-SHA-256, `wal_level=logical`
+- `postgres-ssl` on port 5435 with MD5 auth + SSL enabled (self-signed certs built via `test/Dockerfile.postgres-ssl`)
 
 ## CI Pipeline
 
@@ -188,7 +196,7 @@ The test script:
 |-----|-------------|
 | `test` | `zig fmt --check`, `zig build test`, `zig build` |
 | `cross-compile` | 4-target matrix build with binary size reporting to job summary |
-| `e2e` | Integration tests against MD5 + SCRAM PostgreSQL service containers |
+| `e2e` | Integration tests against MD5 + SCRAM + SSL PostgreSQL service containers |
 | `docker-check` | PR-only Docker build smoke test (no push) |
 | `release` | On `v*` tags: build all targets, create GitHub Release with binaries + checksums |
 | `docker` | On tags/main: multi-platform Docker push to ghcr.io |
@@ -197,9 +205,9 @@ The test script:
 
 **`Dockerfile`** — multi-stage build:
 1. Alpine 3.20 + Zig 0.14.1 → cross-compiles static musl binary
-2. `FROM scratch` — final image contains only the `zemi` binary (~1 MB)
+2. `FROM scratch` — final image contains the `zemi` binary + CA certificates (~1 MB)
 
-Supports both amd64 and arm64 via `TARGETARCH` build arg.
+Supports both amd64 and arm64 via `TARGETARCH` build arg. CA certificates from Alpine are included for SSL/TLS `verify-ca`/`verify-full` modes.
 
 ## Important Conventions and Gotchas
 
@@ -247,7 +255,7 @@ The `changes` table must be filtered from tracking in the main replication loop.
 ├── src/                        # Zig source (the Zemi binary)
 │   ├── main.zig                  # Entry point, orchestration
 │   ├── protocol.zig              # PG wire protocol
-│   ├── connection.zig            # TCP + auth handshake
+│   ├── connection.zig            # TCP + TLS + auth handshake
 │   ├── scram.zig                 # SCRAM-SHA-256 auth
 │   ├── replication.zig           # WAL streaming
 │   ├── decoder.zig               # pgoutput parser + context stitching
@@ -255,7 +263,8 @@ The `changes` table must be filtered from tracking in the main replication loop.
 │   ├── config.zig                # Environment variable config
 │   └── health.zig                # HTTP health check server
 ├── test/
-│   └── e2e.sh                  # E2E integration test script
+│   ├── e2e.sh                  # E2E integration test script
+│   └── Dockerfile.postgres-ssl # SSL-enabled PostgreSQL for testing
 ├── docs/                       # Docusaurus documentation site
 │   ├── docs/
 │   │   ├── zemi/                 # Zemi-specific docs (5 pages)
@@ -281,7 +290,7 @@ The `changes` table must be filtered from tracking in the main replication loop.
 ├── build.zig                   # Zig build configuration
 ├── build.zig.zon               # Zig package manifest
 ├── Dockerfile                  # Multi-stage: Alpine+Zig → scratch
-├── docker-compose.test.yml     # Test PostgreSQL instances (MD5 + SCRAM)
+├── docker-compose.test.yml     # Test PostgreSQL instances (MD5 + SCRAM + SSL)
 ├── .github/workflows/build.yml # CI/CD pipeline
 ├── .tool-versions              # asdf: zig 0.14.1
 ├── Makefile                    # Original Bemi build targets
@@ -297,16 +306,14 @@ The `core/` and `worker/` directories contain the original TypeScript/Node.js co
 ### Completed
 - All 6 phases of the Zig rewrite (protocol, decoding, persistence, context stitching, operations, testing/packaging)
 - SCRAM-SHA-256 authentication (`src/scram.zig` + `src/connection.zig` updates)
-- E2E integration tests (19 assertions across 9 test groups)
-- Full CI pipeline with cross-compilation, E2E, Docker, and release automation
+- SSL/TLS support (`src/connection.zig` — SSLRequest negotiation, TLS handshake, TLS-aware I/O wrappers)
+- SSL configuration (`src/config.zig` — `SslMode` enum, `DB_SSL_MODE`, `DB_SSL_ROOT_CERT`, dest fallbacks)
+- E2E integration tests (25 assertions across 10 test groups including SCRAM and SSL)
+- Full CI pipeline with cross-compilation, E2E (MD5 + SCRAM + SSL), Docker, and release automation
 - Docusaurus documentation (5 Zemi pages + updated site config)
 - Rename from Bemi to Zemi throughout
 
-### Uncommitted Changes
-The SCRAM-SHA-256 feature is code-complete but has not been committed. Modified files: `.github/workflows/build.yml`, `README.md`, `docker-compose.test.yml`, `docs/docs/zemi/architecture.md`, `src/connection.zig`, `src/main.zig`, `test/e2e.sh`. New file: `src/scram.zig`.
-
 ### Potential Future Work
-- **SSL/TLS support** — needed for cloud-hosted PostgreSQL (AWS RDS, Supabase, etc.)
 - **TRUNCATE tracking verification** — pgoutput truncate messages are parsed but not E2E tested
 - **Observability/metrics** — Prometheus endpoint for monitoring
 - **Graceful slot/publication cleanup on shutdown**

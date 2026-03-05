@@ -143,6 +143,42 @@ jobs:
             sleep 1
           done
 
+      - name: Build and start SSL PostgreSQL
+        run: |
+          # Build the SSL PostgreSQL image
+          docker build -t postgres-ssl-test -f test/Dockerfile.postgres-ssl .
+
+          # Run the SSL PostgreSQL container
+          docker run -d --name postgres-ssl \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=zemi_test \
+            -e POSTGRES_HOST_AUTH_METHOD=md5 \
+            -e "POSTGRES_INITDB_ARGS=--auth-host=md5" \
+            -p 5435:5432 \
+            postgres-ssl-test \
+            postgres \
+            -c wal_level=logical \
+            -c max_replication_slots=4 \
+            -c max_wal_senders=4 \
+            -c password_encryption=md5 \
+            -c ssl=on \
+            -c ssl_cert_file=/var/lib/postgresql/ssl/server.crt \
+            -c ssl_key_file=/var/lib/postgresql/ssl/server.key \
+            -c ssl_ca_file=/var/lib/postgresql/ssl/ca.crt
+
+          # Wait for SSL PostgreSQL to be ready
+          for i in $(seq 1 30); do
+            if PGPASSWORD=postgres psql -h 127.0.0.1 -p 5435 -U postgres -d zemi_test -c "SELECT 1;" >/dev/null 2>&1; then
+              echo "SSL PostgreSQL is ready"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "WARNING: SSL PostgreSQL did not become ready in time"
+            fi
+            sleep 1
+          done
+
       - name: Run E2E tests
         run: ./test/e2e.sh --no-docker
 

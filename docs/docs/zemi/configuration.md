@@ -44,6 +44,63 @@ By default, changes are written to the same database being tracked. Set these to
 | `DEST_DB_USER` | Destination user | same as `DB_USER` |
 | `DEST_DB_PASSWORD` | Destination password | same as `DB_PASSWORD` |
 
+## SSL/TLS
+
+Zemi supports encrypted connections to PostgreSQL via SSL/TLS. This is required for most cloud-hosted databases (AWS RDS, Supabase, Neon, etc.).
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DB_SSL_MODE` | SSL mode for source database | `disable` |
+| `DB_SSL_ROOT_CERT` | Path to CA certificate file | system CA bundle |
+| `DEST_DB_SSL_MODE` | SSL mode for destination database | same as `DB_SSL_MODE` |
+| `DEST_DB_SSL_ROOT_CERT` | CA cert path for destination | same as `DB_SSL_ROOT_CERT` |
+
+### SSL Modes
+
+- **`disable`** (default) — no encryption. Use for local/trusted networks.
+- **`require`** — encrypted connection, but no certificate verification. Protects against passive eavesdropping but not man-in-the-middle attacks.
+- **`verify-ca`** — encrypted connection + verify the server's certificate is signed by a trusted CA. Use with `DB_SSL_ROOT_CERT` for self-signed certificates.
+- **`verify-full`** — same as `verify-ca` plus hostname verification. The server certificate's Common Name (or Subject Alternative Name) must match the `DB_HOST`.
+
+### CA Certificates
+
+For `verify-ca` and `verify-full` modes, Zemi needs CA certificates to verify the server:
+
+- **System CA bundle** (default): Automatically loaded from the operating system's trust store (works on Linux and macOS).
+- **Custom CA file**: Set `DB_SSL_ROOT_CERT` to the path of a PEM-encoded CA certificate file. This is useful for self-signed certificates or private CAs.
+
+```bash
+# Use system CA bundle
+DB_SSL_MODE=verify-ca ./zig-out/bin/zemi
+
+# Use custom CA certificate
+DB_SSL_MODE=verify-ca DB_SSL_ROOT_CERT=/etc/ssl/custom-ca.crt ./zig-out/bin/zemi
+```
+
+:::tip Cloud Databases
+Most cloud PostgreSQL providers (AWS RDS, Google Cloud SQL, Azure Database) use certificates signed by well-known CAs included in system trust stores. Set `DB_SSL_MODE=verify-full` for maximum security:
+
+```bash
+DB_HOST=mydb.abc123.us-east-1.rds.amazonaws.com \
+DB_SSL_MODE=verify-full \
+./zig-out/bin/zemi
+```
+:::
+
+:::note Docker
+The Docker image includes system CA certificates from Alpine Linux, so `verify-ca` and `verify-full` work out of the box with well-known CAs (AWS RDS, Google Cloud SQL, etc.). For self-signed or private CA certificates, mount the CA file and set `DB_SSL_ROOT_CERT`:
+
+```bash
+docker run --rm \
+  -v /path/to/ca.crt:/ca.crt:ro \
+  -e DB_SSL_MODE=verify-ca \
+  -e DB_SSL_ROOT_CERT=/ca.crt \
+  -e DB_HOST=mydb.example.com \
+  ...
+  ghcr.io/deanmarano/zemi:latest
+```
+:::
+
 ## Table Filtering
 
 | Variable | Description | Default |
@@ -121,10 +178,12 @@ DB_PORT=5432 \
 DB_NAME=production \
 DB_USER=replication_user \
 DB_PASSWORD=secret \
+DB_SSL_MODE=verify-full \
 DEST_DB_HOST=audit-db.example.com \
 DEST_DB_NAME=audit \
 DEST_DB_USER=audit_writer \
 DEST_DB_PASSWORD=audit_secret \
+DEST_DB_SSL_MODE=verify-full \
 SLOT_NAME=zemi_prod \
 PUBLICATION_NAME=zemi_prod \
 TABLES=users,orders,payments \
@@ -143,6 +202,7 @@ docker run --rm \
   -e DB_NAME=myapp \
   -e DB_USER=postgres \
   -e DB_PASSWORD=secret \
+  -e DB_SSL_MODE=require \
   -e HEALTH_PORT=4005 \
   -e TABLES=users,orders \
   -p 4005:4005 \

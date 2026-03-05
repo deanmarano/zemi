@@ -117,6 +117,21 @@ By default, changes are written to the same database being tracked. Set these to
 | `DEST_DB_USER` | Destination user | same as `DB_USER` |
 | `DEST_DB_PASSWORD` | Destination password | same as `DB_PASSWORD` |
 
+### SSL/TLS
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DB_SSL_MODE` | SSL mode: `disable`, `require`, `verify-ca`, `verify-full` | `disable` |
+| `DB_SSL_ROOT_CERT` | Path to CA certificate file for `verify-ca`/`verify-full` | system CA bundle |
+| `DEST_DB_SSL_MODE` | Destination SSL mode | same as `DB_SSL_MODE` |
+| `DEST_DB_SSL_ROOT_CERT` | Destination CA certificate path | same as `DB_SSL_ROOT_CERT` |
+
+SSL modes:
+- **`disable`** — no encryption (default, for local/trusted networks)
+- **`require`** — encrypted connection, no certificate verification
+- **`verify-ca`** — encrypted + verify the server certificate is signed by a trusted CA
+- **`verify-full`** — encrypted + verify CA + verify the server hostname matches the certificate
+
 ### Operational
 
 | Variable | Description | Default |
@@ -182,13 +197,14 @@ Zemi reads the WAL and writes to PostgreSQL. That's it. One process, one connect
 |  |connection|  |  config  |  |  health  |            |
 |  |          |  |          |  |          |            |
 |  | TCP +    |  | env vars |  | HTTP     |            |
-|  | auth     |  | + valid  |  | /health  |            |
+|  | TLS +    |  | + valid  |  | /health  |            |
+|  | auth     |  |          |  |          |            |
 |  +----------+  +----------+  +----------+            |
 +-----------------------------------------------------+
 ```
 
 - **protocol.zig** -- PostgreSQL wire protocol encoding/decoding, replication messages, MD5 auth
-- **connection.zig** -- TCP connection management, startup/auth handshake (MD5 + SCRAM-SHA-256), simple query protocol
+- **connection.zig** -- TCP connection management, startup/auth handshake (MD5 + SCRAM-SHA-256), SSL/TLS negotiation, simple query protocol
 - **scram.zig** -- SCRAM-SHA-256 authentication (RFC 5802), PBKDF2, HMAC-SHA-256, SASL message building
 - **replication.zig** -- Logical replication stream, slot/publication management, WAL streaming
 - **decoder.zig** -- `pgoutput` logical decoding plugin parser, relation cache, context stitching
@@ -313,7 +329,27 @@ The publication is created automatically (`FOR ALL TABLES` or scoped to `TABLES`
 
 ### Authentication
 
-Zemi supports both **MD5** and **SCRAM-SHA-256** password authentication. SCRAM-SHA-256 is the default in PostgreSQL 16+ and is recommended for production use. SSL/TLS is not yet implemented.
+Zemi supports both **MD5** and **SCRAM-SHA-256** password authentication. SCRAM-SHA-256 is the default in PostgreSQL 16+ and is recommended for production use.
+
+### SSL/TLS
+
+Zemi supports SSL/TLS connections to PostgreSQL, required for most cloud-hosted databases (AWS RDS, Supabase, Neon, etc.):
+
+```bash
+# Encrypted connection (no cert verification)
+DB_SSL_MODE=require ./zig-out/bin/zemi
+
+# Encrypted + verify server certificate against system CA bundle
+DB_SSL_MODE=verify-ca ./zig-out/bin/zemi
+
+# Encrypted + verify CA + hostname verification
+DB_SSL_MODE=verify-full ./zig-out/bin/zemi
+
+# Custom CA certificate (e.g., for self-signed certs)
+DB_SSL_MODE=verify-ca DB_SSL_ROOT_CERT=/path/to/ca.crt ./zig-out/bin/zemi
+```
+
+Uses Zig's stdlib TLS client (TLS 1.2 and 1.3). System CA certificates are loaded automatically on Linux and macOS for `verify-ca`/`verify-full` modes.
 
 ## License
 

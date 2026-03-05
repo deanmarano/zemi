@@ -25,6 +25,8 @@ pub const Storage = struct {
                 config.getDestPassword(),
                 config.getDestName(),
                 null, // normal connection, not replication
+                config.getDestSslMode(),
+                config.getDestSslRootCert(),
             ),
             .allocator = allocator,
         };

@@ -53,6 +53,8 @@ cleanup() {
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS test_users CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS test_orders CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
+    # Clean up SSL test temp files
+    rm -rf /tmp/zemi-ssl-certs 2>/dev/null || true
     if [ "$USE_DOCKER" = true ]; then
         docker compose -f "$ROOT_DIR/docker-compose.test.yml" down -v 2>/dev/null || true
     fi
@@ -417,6 +419,161 @@ if [ "$SCRAM_AVAILABLE" = true ]; then
     scram_cleanup
 else
     echo "  SKIP: SCRAM PostgreSQL not available on port $SCRAM_PORT"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 10: SSL/TLS connection (sslmode=require)
+# ---------------------------------------------------------------------------
+echo ""
+echo "$(bold "[Test 10] SSL/TLS connection")"
+
+SSL_PORT="${SSL_PORT:-5435}"
+SSL_PSQL="psql -h $DB_HOST -p $SSL_PORT -U $DB_USER -d $DB_NAME -X -q"
+SSL_ZEMI_PID=""
+
+ssl_query() {
+    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -t -A -c "$1" 2>/dev/null
+}
+
+ssl_cleanup() {
+    if [ -n "$SSL_ZEMI_PID" ] && kill -0 "$SSL_ZEMI_PID" 2>/dev/null; then
+        kill "$SSL_ZEMI_PID" 2>/dev/null || true
+        wait "$SSL_ZEMI_PID" 2>/dev/null || true
+    fi
+    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SELECT pg_drop_replication_slot('zemi_ssl_test');" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP PUBLICATION IF EXISTS zemi_ssl_pub;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP TABLE IF EXISTS ssl_test_items CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
+}
+
+# Check if SSL PostgreSQL is available
+SSL_AVAILABLE=false
+for i in $(seq 1 15); do
+    if PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SELECT 1;" >/dev/null 2>&1; then
+        SSL_AVAILABLE=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "$SSL_AVAILABLE" = true ]; then
+    # Verify SSL is enabled on the server
+    SSL_ENABLED=$(ssl_query "SHOW ssl;")
+    if [ "$SSL_ENABLED" != "on" ]; then
+        echo "  SKIP: SSL not enabled on PostgreSQL at port $SSL_PORT (ssl=$SSL_ENABLED)"
+    else
+        # Clean up any previous state
+        ssl_cleanup
+
+        # Create test table and publication
+        ssl_query "CREATE TABLE ssl_test_items (id SERIAL PRIMARY KEY, name TEXT NOT NULL);"
+        ssl_query "CREATE PUBLICATION zemi_ssl_pub FOR TABLE ssl_test_items;"
+
+        # --- Test 10a: sslmode=require (no cert verification) ---
+        echo "  $(bold "10a: sslmode=require")"
+
+        DB_PORT="$SSL_PORT" \
+        DB_SSL_MODE="require" \
+        SLOT_NAME="zemi_ssl_test" \
+        PUBLICATION_NAME="zemi_ssl_pub" \
+        "$ZEMI_BIN" > /tmp/zemi-e2e-ssl.log 2>&1 &
+        SSL_ZEMI_PID=$!
+
+        sleep 3
+
+        if kill -0 "$SSL_ZEMI_PID" 2>/dev/null; then
+            assert_eq "Zemi connects with SSL (require)" "running" "running"
+
+            # Insert and verify tracking works over SSL
+            ssl_query "INSERT INTO ssl_test_items (name) VALUES ('ssl-test-item');"
+
+            SSL_ELAPSED=0
+            while [ "$SSL_ELAPSED" -lt 15 ]; do
+                SSL_COUNT=$(ssl_query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'ssl_test_items';" 2>/dev/null || echo "0")
+                if [ "$SSL_COUNT" -ge 1 ]; then break; fi
+                sleep 1
+                SSL_ELAPSED=$((SSL_ELAPSED + 1))
+            done
+
+            SSL_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;")
+            assert_eq "SSL: INSERT tracked as CREATE" "CREATE" "$SSL_OP"
+
+            SSL_AFTER=$(ssl_query "SELECT after->>'name' FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;")
+            assert_eq "SSL: after contains inserted data" "ssl-test-item" "$SSL_AFTER"
+        else
+            echo "  $(red "FAIL") Zemi failed to start with SSL (require)"
+            echo "  --- SSL Zemi logs:"
+            cat /tmp/zemi-e2e-ssl.log
+            FAIL=$((FAIL + 3))
+            TOTAL=$((TOTAL + 3))
+        fi
+
+        # Stop SSL Zemi instance
+        if [ -n "$SSL_ZEMI_PID" ] && kill -0 "$SSL_ZEMI_PID" 2>/dev/null; then
+            kill "$SSL_ZEMI_PID" 2>/dev/null || true
+            wait "$SSL_ZEMI_PID" 2>/dev/null || true
+        fi
+        SSL_ZEMI_PID=""
+
+        # --- Test 10b: sslmode=verify-ca with root cert ---
+        echo "  $(bold "10b: sslmode=verify-ca")"
+
+        # Extract the CA certificate from the SSL container
+        SSL_CERT_DIR="/tmp/zemi-ssl-certs"
+        mkdir -p "$SSL_CERT_DIR"
+
+        if [ "$USE_DOCKER" = true ]; then
+            SSL_CONTAINER=$(docker ps --format '{{.ID}} {{.Ports}}' | grep '5435->5432' | awk '{print $1}')
+            docker cp "$SSL_CONTAINER:/var/lib/postgresql/ssl/root.crt" "$SSL_CERT_DIR/root.crt" 2>/dev/null
+        fi
+
+        if [ -f "$SSL_CERT_DIR/root.crt" ]; then
+            # Clean up changes from 10a
+            ssl_query "DELETE FROM changes;"
+            ssl_query "DELETE FROM ssl_test_items;"
+
+            DB_PORT="$SSL_PORT" \
+            DB_SSL_MODE="verify-ca" \
+            DB_SSL_ROOT_CERT="$SSL_CERT_DIR/root.crt" \
+            SLOT_NAME="zemi_ssl_test" \
+            PUBLICATION_NAME="zemi_ssl_pub" \
+            "$ZEMI_BIN" > /tmp/zemi-e2e-ssl-verify.log 2>&1 &
+            SSL_ZEMI_PID=$!
+
+            sleep 3
+
+            if kill -0 "$SSL_ZEMI_PID" 2>/dev/null; then
+                assert_eq "Zemi connects with SSL (verify-ca)" "running" "running"
+
+                ssl_query "INSERT INTO ssl_test_items (name) VALUES ('ssl-verify-ca-item');"
+
+                SSL_ELAPSED=0
+                while [ "$SSL_ELAPSED" -lt 15 ]; do
+                    SSL_COUNT=$(ssl_query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'ssl_test_items';" 2>/dev/null || echo "0")
+                    if [ "$SSL_COUNT" -ge 1 ]; then break; fi
+                    sleep 1
+                    SSL_ELAPSED=$((SSL_ELAPSED + 1))
+                done
+
+                SSL_VERIFY_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;")
+                assert_eq "SSL verify-ca: INSERT tracked" "CREATE" "$SSL_VERIFY_OP"
+            else
+                echo "  $(red "FAIL") Zemi failed to start with SSL (verify-ca)"
+                echo "  --- SSL verify-ca Zemi logs:"
+                cat /tmp/zemi-e2e-ssl-verify.log
+                FAIL=$((FAIL + 2))
+                TOTAL=$((TOTAL + 2))
+            fi
+
+            rm -rf "$SSL_CERT_DIR"
+        else
+            echo "  SKIP: Could not extract root certificate (--no-docker without cert path)"
+        fi
+
+        ssl_cleanup
+    fi
+else
+    echo "  SKIP: SSL PostgreSQL not available on port $SSL_PORT"
 fi
 
 # ===========================================================================

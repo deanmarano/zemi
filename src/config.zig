@@ -2,6 +2,35 @@ const std = @import("std");
 
 const log = std.log.scoped(.config);
 
+/// SSL/TLS connection mode, modeled after libpq sslmode values.
+pub const SslMode = enum {
+    /// No SSL (default for backward compatibility)
+    disable,
+    /// Encrypt the connection but do not verify the server certificate
+    require,
+    /// Encrypt and verify the server certificate against the CA bundle
+    verify_ca,
+    /// Encrypt, verify the CA, and verify that the server hostname matches
+    verify_full,
+
+    pub fn fromString(s: []const u8) ?SslMode {
+        if (std.mem.eql(u8, s, "disable")) return .disable;
+        if (std.mem.eql(u8, s, "require")) return .require;
+        if (std.mem.eql(u8, s, "verify-ca")) return .verify_ca;
+        if (std.mem.eql(u8, s, "verify-full")) return .verify_full;
+        return null;
+    }
+
+    pub fn toString(self: SslMode) []const u8 {
+        return switch (self) {
+            .disable => "disable",
+            .require => "require",
+            .verify_ca => "verify-ca",
+            .verify_full => "verify-full",
+        };
+    }
+};
+
 /// Configuration parsed from environment variables.
 /// Compatible with the original Bemi environment variable interface.
 pub const Config = struct {
@@ -11,6 +40,10 @@ pub const Config = struct {
     db_name: []const u8 = "postgres",
     db_user: []const u8 = "postgres",
     db_password: []const u8 = "postgres",
+
+    // Source database SSL settings
+    db_ssl_mode: SslMode = .disable,
+    db_ssl_root_cert: ?[]const u8 = null, // path to custom CA cert file
 
     // Replication settings
     slot_name: []const u8 = "zemi",
@@ -23,6 +56,10 @@ pub const Config = struct {
     dest_db_name: ?[]const u8 = null,
     dest_db_user: ?[]const u8 = null,
     dest_db_password: ?[]const u8 = null,
+
+    // Destination database SSL settings (fall back to source if not set)
+    dest_db_ssl_mode: ?SslMode = null,
+    dest_db_ssl_root_cert: ?[]const u8 = null,
 
     // Logging
     log_level: std.log.Level = .info,
@@ -50,6 +87,12 @@ pub const Config = struct {
     }
     pub fn getDestPassword(self: Config) []const u8 {
         return self.dest_db_password orelse self.db_password;
+    }
+    pub fn getDestSslMode(self: Config) SslMode {
+        return self.dest_db_ssl_mode orelse self.db_ssl_mode;
+    }
+    pub fn getDestSslRootCert(self: Config) ?[]const u8 {
+        return self.dest_db_ssl_root_cert orelse self.db_ssl_root_cert;
     }
 
     /// Check if a given table name should be tracked.
@@ -80,6 +123,16 @@ pub const Config = struct {
         if (std.posix.getenv("DB_NAME")) |v| config.db_name = v;
         if (std.posix.getenv("DB_USER")) |v| config.db_user = v;
         if (std.posix.getenv("DB_PASSWORD")) |v| config.db_password = v;
+        if (std.posix.getenv("DB_SSL_MODE")) |v| {
+            if (SslMode.fromString(v)) |mode| {
+                config.db_ssl_mode = mode;
+            } else {
+                log.warn("unknown DB_SSL_MODE '{s}', using default 'disable'", .{v});
+            }
+        }
+        if (std.posix.getenv("DB_SSL_ROOT_CERT")) |v| {
+            if (v.len > 0) config.db_ssl_root_cert = v;
+        }
         if (std.posix.getenv("SLOT_NAME")) |v| config.slot_name = v;
         if (std.posix.getenv("PUBLICATION_NAME")) |v| config.publication_name = v;
 
@@ -94,6 +147,16 @@ pub const Config = struct {
         if (std.posix.getenv("DEST_DB_NAME")) |v| config.dest_db_name = v;
         if (std.posix.getenv("DEST_DB_USER")) |v| config.dest_db_user = v;
         if (std.posix.getenv("DEST_DB_PASSWORD")) |v| config.dest_db_password = v;
+        if (std.posix.getenv("DEST_DB_SSL_MODE")) |v| {
+            if (SslMode.fromString(v)) |mode| {
+                config.dest_db_ssl_mode = mode;
+            } else {
+                log.warn("unknown DEST_DB_SSL_MODE '{s}', ignoring", .{v});
+            }
+        }
+        if (std.posix.getenv("DEST_DB_SSL_ROOT_CERT")) |v| {
+            if (v.len > 0) config.dest_db_ssl_root_cert = v;
+        }
 
         if (std.posix.getenv("LOG_LEVEL")) |v| {
             if (std.mem.eql(u8, v, "debug") or std.mem.eql(u8, v, "DEBUG")) {
@@ -151,6 +214,13 @@ pub const Config = struct {
             self.slot_name,
             self.publication_name,
         });
+        if (self.db_ssl_mode != .disable) {
+            if (self.db_ssl_root_cert) |cert_path| {
+                log.info("config: ssl_mode={s} ssl_root_cert={s}", .{ self.db_ssl_mode.toString(), cert_path });
+            } else {
+                log.info("config: ssl_mode={s}", .{self.db_ssl_mode.toString()});
+            }
+        }
         const dest_host = self.getDestHost();
         const dest_port = self.getDestPort();
         const dest_name = self.getDestName();
@@ -159,6 +229,14 @@ pub const Config = struct {
             log.info("config: dest_host={s} dest_port={d} dest_db={s} dest_user={s}", .{
                 dest_host, dest_port, dest_name, dest_user,
             });
+            const dest_ssl = self.getDestSslMode();
+            if (dest_ssl != .disable) {
+                if (self.getDestSslRootCert()) |cert_path| {
+                    log.info("config: dest_ssl_mode={s} dest_ssl_root_cert={s}", .{ dest_ssl.toString(), cert_path });
+                } else {
+                    log.info("config: dest_ssl_mode={s}", .{dest_ssl.toString()});
+                }
+            }
         } else {
             log.info("config: changes written to source database", .{});
         }
@@ -221,4 +299,39 @@ test "validate catches empty required fields" {
         const config = Config{ .shutdown_timeout_secs = 0 };
         try std.testing.expect(config.validate() != null);
     }
+}
+
+test "SslMode.fromString parses valid modes" {
+    try std.testing.expectEqual(SslMode.disable, SslMode.fromString("disable").?);
+    try std.testing.expectEqual(SslMode.require, SslMode.fromString("require").?);
+    try std.testing.expectEqual(SslMode.verify_ca, SslMode.fromString("verify-ca").?);
+    try std.testing.expectEqual(SslMode.verify_full, SslMode.fromString("verify-full").?);
+    try std.testing.expect(SslMode.fromString("invalid") == null);
+    try std.testing.expect(SslMode.fromString("") == null);
+}
+
+test "SslMode.toString roundtrips" {
+    try std.testing.expectEqualStrings("disable", SslMode.disable.toString());
+    try std.testing.expectEqualStrings("require", SslMode.require.toString());
+    try std.testing.expectEqualStrings("verify-ca", SslMode.verify_ca.toString());
+    try std.testing.expectEqualStrings("verify-full", SslMode.verify_full.toString());
+}
+
+test "dest SSL falls back to source SSL settings" {
+    const config = Config{
+        .db_ssl_mode = .verify_full,
+        .db_ssl_root_cert = "/etc/ssl/certs/ca.crt",
+    };
+    try std.testing.expectEqual(SslMode.verify_full, config.getDestSslMode());
+    try std.testing.expectEqualStrings("/etc/ssl/certs/ca.crt", config.getDestSslRootCert().?);
+
+    // Explicit dest overrides source
+    const config2 = Config{
+        .db_ssl_mode = .verify_full,
+        .db_ssl_root_cert = "/etc/ssl/certs/ca.crt",
+        .dest_db_ssl_mode = .require,
+        .dest_db_ssl_root_cert = "/other/ca.crt",
+    };
+    try std.testing.expectEqual(SslMode.require, config2.getDestSslMode());
+    try std.testing.expectEqualStrings("/other/ca.crt", config2.getDestSslRootCert().?);
 }

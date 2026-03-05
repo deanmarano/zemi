@@ -5,7 +5,7 @@ FROM alpine:3.20 AS builder
 ARG ZIG_VERSION=0.14.1
 ARG TARGETARCH
 
-RUN apk add --no-cache curl xz && \
+RUN apk add --no-cache curl xz ca-certificates && \
     case "${TARGETARCH}" in \
         amd64) ZIG_ARCH="x86_64" ;; \
         arm64) ZIG_ARCH="aarch64" ;; \
@@ -34,6 +34,9 @@ RUN case "${TARGETARCH}" in \
 FROM scratch
 
 COPY --from=builder /zemi /zemi
+
+# Include CA certificates for SSL/TLS connections (verify-ca, verify-full)
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # Health check port (optional, set HEALTH_PORT to enable)
 EXPOSE 4005

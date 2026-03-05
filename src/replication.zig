@@ -29,6 +29,8 @@ pub const ReplicationStream = struct {
             config.db_password,
             config.db_name,
             "database", // replication=database
+            config.db_ssl_mode,
+            config.db_ssl_root_cert,
         ) catch |err| {
             log.err("failed to open replication connection: {}", .{err});
             return err;
@@ -201,6 +203,8 @@ pub fn ensurePublication(allocator: std.mem.Allocator, config: Config) !void {
         config.db_password,
         config.db_name,
         null, // normal connection
+        config.db_ssl_mode,
+        config.db_ssl_root_cert,
     );
     defer conn.close();
 

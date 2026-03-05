@@ -2,17 +2,25 @@ const std = @import("std");
 const mem = std.mem;
 const net = std.net;
 const posix = std.posix;
+const tls = std.crypto.tls;
+const Certificate = std.crypto.Certificate;
 const protocol = @import("protocol.zig");
 const scram = @import("scram.zig");
+const config_mod = @import("config.zig");
+const SslMode = config_mod.SslMode;
 
 const log = std.log.scoped(.connection);
 
-/// PostgreSQL connection wrapping a TCP socket.
+/// PostgreSQL connection wrapping a TCP socket with optional TLS.
 /// Handles the wire protocol: startup, authentication, simple queries,
 /// and reading raw backend messages.
 pub const Connection = struct {
     stream: net.Stream,
     allocator: std.mem.Allocator,
+
+    // TLS state (null when not using SSL)
+    tls_client: ?tls.Client = null,
+    ca_bundle: ?Certificate.Bundle = null,
 
     // Read buffer for receiving messages
     read_buf: [64 * 1024]u8 = undefined,
@@ -43,6 +51,8 @@ pub const Connection = struct {
         ServerNonceMismatch,
         ServerSignatureMismatch,
         Base64DecodeFailed,
+        SslNotSupported,
+        SslCertificateError,
     } || net.Stream.ReadError || net.Stream.WriteError || std.mem.Allocator.Error || error{
         UnexpectedEndOfData,
         InvalidLsn,
@@ -60,6 +70,8 @@ pub const Connection = struct {
         password: []const u8,
         database: []const u8,
         replication: ?[]const u8,
+        ssl_mode: SslMode,
+        ssl_root_cert: ?[]const u8,
     ) ConnectError!Connection {
         const address = net.Address.resolveIp(host, port) catch |err| {
             log.err("failed to resolve {s}:{d}: {}", .{ host, port, err });
@@ -83,19 +95,172 @@ pub const Connection = struct {
             .server_params = std.StringHashMap([]const u8).init(allocator),
         };
 
-        try conn.performStartup();
+        // Negotiate SSL if requested
+        if (ssl_mode != .disable) {
+            conn.negotiateSsl(ssl_mode, ssl_root_cert) catch |err| {
+                log.err("SSL negotiation failed: {}", .{err});
+                conn.stream.close();
+                return err;
+            };
+        }
+
+        conn.performStartup() catch |err| {
+            if (conn.ca_bundle) |*bundle| bundle.deinit(allocator);
+            conn.stream.close();
+            return err;
+        };
+
         return conn;
     }
 
     pub fn close(self: *Connection) void {
         // Send Terminate message
         const term_msg = protocol.buildTerminateMessage(self.allocator) catch {
+            if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
             self.stream.close();
             return;
         };
         defer self.allocator.free(term_msg);
-        self.stream.writeAll(term_msg) catch {};
+        self.tlsWriteAll(term_msg) catch {};
+        if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
         self.stream.close();
+    }
+
+    // ========================================================================
+    // SSL/TLS Negotiation
+    // ========================================================================
+
+    fn negotiateSsl(self: *Connection, ssl_mode: SslMode, ssl_root_cert: ?[]const u8) ConnectError!void {
+        // Step 1: Send SSLRequest on raw TCP stream (before TLS handshake)
+        const ssl_request = protocol.buildSslRequest();
+        self.stream.writeAll(&ssl_request) catch |err| {
+            log.err("failed to send SSLRequest: {}", .{err});
+            return error.ConnectionRefused;
+        };
+
+        // Step 2: Read single-byte response
+        var response: [1]u8 = undefined;
+        const n = self.stream.read(&response) catch |err| {
+            log.err("failed to read SSLRequest response: {}", .{err});
+            return error.ConnectionRefused;
+        };
+        if (n == 0) {
+            log.err("server closed connection during SSL negotiation", .{});
+            return error.UnexpectedEndOfData;
+        }
+
+        if (response[0] == 'S') {
+            // Server accepts SSL — perform TLS handshake
+            log.info("server accepted SSL, starting TLS handshake", .{});
+            try self.performTlsHandshake(ssl_mode, ssl_root_cert);
+        } else if (response[0] == 'N') {
+            // Server does not support SSL
+            if (ssl_mode == .require or ssl_mode == .verify_ca or ssl_mode == .verify_full) {
+                log.err("server does not support SSL but ssl_mode={s} requires it", .{ssl_mode.toString()});
+                return error.SslNotSupported;
+            }
+            log.info("server does not support SSL, continuing with plain connection", .{});
+        } else {
+            log.err("unexpected SSL response byte: 0x{x}", .{response[0]});
+            return error.InvalidServerResponse;
+        }
+    }
+
+    fn performTlsHandshake(self: *Connection, ssl_mode: SslMode, ssl_root_cert: ?[]const u8) ConnectError!void {
+        // Load CA certificates if needed for verify modes
+        if (ssl_mode == .verify_ca or ssl_mode == .verify_full) {
+            var bundle = Certificate.Bundle{};
+            if (ssl_root_cert) |cert_path| {
+                log.info("loading CA certificate from {s}", .{cert_path});
+                bundle.addCertsFromFilePathAbsolute(self.allocator, cert_path) catch |err| {
+                    log.err("failed to load CA certificate from {s}: {}", .{ cert_path, err });
+                    return error.SslCertificateError;
+                };
+            } else {
+                log.debug("loading system CA certificates", .{});
+                bundle.rescan(self.allocator) catch |err| {
+                    log.err("failed to load system CA certificates: {}", .{err});
+                    return error.SslCertificateError;
+                };
+            }
+            self.ca_bundle = bundle;
+        }
+
+        // Build TLS options based on SSL mode
+        var options: tls.Client.Options = switch (ssl_mode) {
+            .disable => unreachable,
+            .require => .{
+                .host = .no_verification,
+                .ca = .no_verification,
+            },
+            .verify_ca => .{
+                .host = .no_verification,
+                .ca = .{ .bundle = self.ca_bundle.? },
+            },
+            .verify_full => .{
+                .host = .{ .explicit = self.host },
+                .ca = .{ .bundle = self.ca_bundle.? },
+            },
+        };
+        _ = &options;
+
+        self.tls_client = tls.Client.init(self.stream, options) catch |err| {
+            log.err("TLS handshake failed: {}", .{err});
+            return error.ConnectionRefused;
+        };
+
+        // Allow truncation attacks because PostgreSQL servers don't always
+        // send TLS close_notify on disconnect.
+        self.tls_client.?.allow_truncation_attacks = true;
+
+        log.info("TLS handshake complete (version={s})", .{@tagName(self.tls_client.?.tls_version)});
+    }
+
+    // ========================================================================
+    // TLS-aware I/O helpers
+    // ========================================================================
+
+    /// Read bytes through TLS if active, otherwise raw TCP.
+    /// Returns number of bytes read, 0 means end of stream.
+    /// TLS-specific errors are mapped to ConnectionRefused for simplicity.
+    fn tlsRead(self: *Connection, buf: []u8) net.Stream.ReadError!usize {
+        if (self.tls_client) |*tc| {
+            return tc.read(self.stream, buf) catch |err| {
+                // Map TLS-specific errors to stream-level errors that ConnectError understands
+                const is_stream_err = @as(?net.Stream.ReadError, switch (err) {
+                    error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                    error.BrokenPipe => error.BrokenPipe,
+                    error.ConnectionTimedOut => error.ConnectionTimedOut,
+                    else => null,
+                });
+                if (is_stream_err) |stream_err| return stream_err;
+                // TLS protocol errors (alerts, truncation, decode errors) — treat as EOF
+                log.warn("TLS read error: {}, treating as connection close", .{err});
+                return 0;
+            };
+        } else {
+            return self.stream.read(buf);
+        }
+    }
+
+    /// Write all bytes through TLS if active, otherwise raw TCP.
+    fn tlsWriteAll(self: *Connection, data: []const u8) net.Stream.WriteError!void {
+        if (self.tls_client) |*tc| {
+            tc.writeAll(self.stream, data) catch |err| {
+                // Map TLS-specific errors to stream-level errors
+                const is_stream_err = @as(?net.Stream.WriteError, switch (err) {
+                    error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                    error.BrokenPipe => error.BrokenPipe,
+                    error.AccessDenied => error.AccessDenied,
+                    else => null,
+                });
+                if (is_stream_err) |stream_err| return stream_err;
+                log.warn("TLS write error: {}, treating as broken pipe", .{err});
+                return error.BrokenPipe;
+            };
+        } else {
+            try self.stream.writeAll(data);
+        }
     }
 
     // ========================================================================
@@ -119,7 +284,7 @@ pub const Connection = struct {
         const startup_msg = try protocol.buildStartupMessage(self.allocator, params_list.items);
         defer self.allocator.free(startup_msg);
 
-        try self.stream.writeAll(startup_msg);
+        try self.tlsWriteAll(startup_msg);
 
         // Read responses until ReadyForQuery
         try self.handleStartupResponses();
@@ -189,7 +354,7 @@ pub const Connection = struct {
                 log.debug("server requests cleartext password", .{});
                 const msg = try protocol.buildPasswordMessage(self.allocator, self.password);
                 defer self.allocator.free(msg);
-                try self.stream.writeAll(msg);
+                try self.tlsWriteAll(msg);
             },
             .md5_password => {
                 log.debug("server requests MD5 password", .{});
@@ -197,7 +362,7 @@ pub const Connection = struct {
                 const hashed = protocol.computeMd5Password(self.user, self.password, salt[0..4].*);
                 const msg = try protocol.buildPasswordMessage(self.allocator, &hashed);
                 defer self.allocator.free(msg);
-                try self.stream.writeAll(msg);
+                try self.tlsWriteAll(msg);
             },
             .sasl => {
                 // Read available SASL mechanisms and check for SCRAM-SHA-256
@@ -225,7 +390,7 @@ pub const Connection = struct {
 
                 const msg = try scram.buildSaslInitialResponse(self.allocator, "SCRAM-SHA-256", client_first);
                 defer self.allocator.free(msg);
-                try self.stream.writeAll(msg);
+                try self.tlsWriteAll(msg);
 
                 self.scram_client = sc;
             },
@@ -240,7 +405,7 @@ pub const Connection = struct {
 
                     const msg = try scram.buildSaslResponse(self.allocator, client_final);
                     defer self.allocator.free(msg);
-                    try self.stream.writeAll(msg);
+                    try self.tlsWriteAll(msg);
                 } else {
                     log.err("received SASL continue without prior SASL init", .{});
                     return error.AuthenticationFailed;
@@ -294,7 +459,7 @@ pub const Connection = struct {
     pub fn query(self: *Connection, sql: []const u8) ConnectError!QueryResult {
         const msg = try protocol.buildQueryMessage(self.allocator, sql);
         defer self.allocator.free(msg);
-        try self.stream.writeAll(msg);
+        try self.tlsWriteAll(msg);
 
         var columns: []protocol.FieldDescription = &.{};
         var rows = std.ArrayList(protocol.DataRow).init(self.allocator);
@@ -413,7 +578,7 @@ pub const Connection = struct {
 
     /// Send raw bytes to the server.
     pub fn sendRaw(self: *Connection, data: []const u8) !void {
-        try self.stream.writeAll(data);
+        try self.tlsWriteAll(data);
     }
 
     // ========================================================================
@@ -432,8 +597,8 @@ pub const Connection = struct {
                 self.read_pos = 0;
             }
 
-            // Read more data
-            const n = try self.stream.read(self.read_buf[self.read_len..]);
+            // Read more data (through TLS if active)
+            const n = try self.tlsRead(self.read_buf[self.read_len..]);
             if (n == 0) return error.UnexpectedEndOfData;
             self.read_len += n;
         }

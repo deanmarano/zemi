@@ -1,0 +1,35 @@
+# PostgreSQL with self-signed SSL certificates for testing
+FROM postgres:16-alpine
+
+# Generate self-signed SSL certificates
+RUN apk add --no-cache openssl && \
+    mkdir -p /var/lib/postgresql/ssl && \
+    # Generate CA
+    openssl req -new -x509 -days 365 -nodes \
+        -subj "/CN=Zemi Test CA" \
+        -keyout /var/lib/postgresql/ssl/ca.key \
+        -out /var/lib/postgresql/ssl/ca.crt 2>/dev/null && \
+    # Generate server key and CSR
+    openssl req -new -nodes \
+        -subj "/CN=localhost" \
+        -addext "subjectAltName=DNS:localhost,DNS:postgres-ssl,IP:127.0.0.1" \
+        -keyout /var/lib/postgresql/ssl/server.key \
+        -out /var/lib/postgresql/ssl/server.csr 2>/dev/null && \
+    # Sign server certificate with CA (with SANs)
+    openssl x509 -req -days 365 \
+        -in /var/lib/postgresql/ssl/server.csr \
+        -CA /var/lib/postgresql/ssl/ca.crt \
+        -CAkey /var/lib/postgresql/ssl/ca.key \
+        -CAcreateserial \
+        -copy_extensions copyall \
+        -out /var/lib/postgresql/ssl/server.crt 2>/dev/null && \
+    # Set correct ownership and permissions
+    chown postgres:postgres /var/lib/postgresql/ssl/server.key && \
+    chmod 600 /var/lib/postgresql/ssl/server.key && \
+    chmod 644 /var/lib/postgresql/ssl/server.crt && \
+    chmod 644 /var/lib/postgresql/ssl/ca.crt && \
+    # Copy CA cert as root.crt for client verification
+    cp /var/lib/postgresql/ssl/ca.crt /var/lib/postgresql/ssl/root.crt && \
+    # Clean up
+    rm -f /var/lib/postgresql/ssl/server.csr /var/lib/postgresql/ssl/ca.srl && \
+    apk del openssl

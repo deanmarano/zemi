@@ -273,6 +273,21 @@ pub const MessageWriter = struct {
 };
 
 // ============================================================================
+// SSL Request message (no type byte, special format)
+// ============================================================================
+
+/// Build a PostgreSQL SSLRequest message.
+/// This is sent before the startup message to negotiate SSL.
+/// Format: Int32(8) length + Int32(80877103) SSL request code.
+/// The server responds with a single byte: 'S' (SSL ok) or 'N' (SSL refused).
+pub fn buildSslRequest() [8]u8 {
+    var msg: [8]u8 = undefined;
+    mem.writeInt(u32, msg[0..4], 8, .big); // length includes self
+    mem.writeInt(u32, msg[4..8], 80877103, .big); // SSL request code
+    return msg;
+}
+
+// ============================================================================
 // Startup message (no type byte, special format)
 // ============================================================================
 
@@ -752,4 +767,16 @@ test "buildStandbyStatusUpdate format" {
     try std.testing.expectEqual(@as(usize, 39), msg.len);
     // Inner first byte should be 'r'
     try std.testing.expectEqual(@as(u8, 'r'), msg[5]);
+}
+
+test "buildSslRequest produces correct 8-byte message" {
+    const msg = buildSslRequest();
+    // Total length = 8
+    try std.testing.expectEqual(@as(usize, 8), msg.len);
+    // First 4 bytes: length field = 8 (big-endian)
+    const length = mem.readInt(u32, msg[0..4], .big);
+    try std.testing.expectEqual(@as(u32, 8), length);
+    // Next 4 bytes: SSL request code = 80877103 (big-endian)
+    const code = mem.readInt(u32, msg[4..8], .big);
+    try std.testing.expectEqual(@as(u32, 80877103), code);
 }

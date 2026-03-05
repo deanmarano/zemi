@@ -189,3 +189,10 @@ pnpm-lock.yaml
 /docs/build
 # Generated files
 /docs/.cache-loader
+
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Worker workspace artifacts
+worker/core/

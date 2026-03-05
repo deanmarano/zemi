@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   test:
-    name: Unit Tests
+    name: Test & Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,11 +22,51 @@ jobs:
         with:
           version: 0.14.1
 
+      - name: Check formatting
+        run: zig fmt --check src/ build.zig
+
       - name: Run tests
         run: zig build test
 
       - name: Build (verify compilation)
         run: zig build
+
+  cross-compile:
+    name: Cross-Compile (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - label: x86_64-linux
+            target: x86_64-linux-musl
+          - label: aarch64-linux
+            target: aarch64-linux-musl
+          - label: x86_64-macos
+            target: x86_64-macos-none
+          - label: aarch64-macos
+            target: aarch64-macos-none
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Build for ${{ matrix.label }}
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Report binary size
+        run: |
+          BINARY="zig-out/bin/zemi"
+          SIZE_BYTES=$(stat --format=%s "$BINARY")
+          SIZE_MB=$(awk "BEGIN {printf \"%.2f\", $SIZE_BYTES/1048576}")
+          echo "### Binary Size: ${{ matrix.label }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | Size |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`${{ matrix.label }}\` | ${SIZE_MB} MB (${SIZE_BYTES} bytes) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Binary size (${{ matrix.label }})::${SIZE_MB} MB (${SIZE_BYTES} bytes)"
 
   e2e:
     name: E2E Tests
@@ -76,9 +116,29 @@ jobs:
       - name: Run E2E tests
         run: ./test/e2e.sh --no-docker
 
+  docker-check:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   release:
     name: Release
-    needs: [test, e2e]
+    needs: [test, e2e, cross-compile]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

@@ -628,7 +628,7 @@ test "MessageReader reads basic types" {
     const data = [_]u8{
         0x00, 0x01, // Int16 = 1
         0x00, 0x00, 0x00, 0x02, // Int32 = 2
-        'h',  'i',  0, // String "hi"
+        'h', 'i', 0, // String "hi"
         0xFF, // Byte 255
     };
     var reader = MessageReader.init(&data);

@@ -115,14 +115,16 @@ pgoutput logical decoding message parser and transaction state machine.
 - **Context stitching**: Logical decoding messages with prefix `_bemi` (transactional only) are captured as `transaction_context` and stamped onto all changes in the same transaction at commit time. This `_bemi` prefix is part of the wire protocol used by ORM packages — do NOT rename it.
 - Key detail: The decoder uses two-layer ownership. The parser returns slices into the read buffer (zero-copy). `decode()` then dupes all strings it needs for `Change` records that outlive the buffer.
 
-**`src/storage.zig`** (~543 lines, 10 tests)
-Change persistence to PostgreSQL with schema migration and retry logic.
-- `Storage` — wraps a `Connection` to the destination database
+**`src/storage.zig`** (~595 lines, 10 tests)
+Change persistence to PostgreSQL with schema migration, retry logic, and automatic reconnection.
+- `Storage` — wraps a `Connection` and `Config` for the destination database; resilient to connection drops
 - `init()` — connects and runs idempotent migrations (CREATE TABLE IF NOT EXISTS, indexes, unique constraint)
-- `persistChanges()` — multi-row INSERT with `ON CONFLICT DO NOTHING` for deduplication; retries transient errors up to 3 times with exponential backoff (100ms base)
+- `reconnect()` — closes the dead connection, opens a fresh one, and re-runs migrations (idempotent). Called automatically by `persistChanges()` on transient failures.
+- `persistChanges()` — multi-row INSERT with `ON CONFLICT DO NOTHING` for deduplication; retries transient errors up to 3 times with exponential backoff (100ms base). On each retry, reconnects to the destination database before re-executing the query.
 - JSON serialization: `appendJsonObject()` / `appendJsonString()` build JSONB literals with proper escaping
 - The `changes` table schema has 14 columns including UUID PK, JSONB before/after/context, GIN indexes, and a unique constraint on (position, table, schema, database, operation) for deduplication.
 - Key detail: The `changes` table itself must be filtered from tracking (in `main.zig`) to prevent infinite recursive WAL events.
+- Key detail: Storage stores the full `Config` so it can reconnect without external help. The reconnection is transparent to callers — `persistChanges()` handles it internally.
 
 **`src/config.zig`** (~345 lines, 7 tests)
 Environment variable configuration.
@@ -251,6 +253,16 @@ The `changes` table must be filtered from tracking in the main replication loop.
 - Table migration uses `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`
 - Change persistence uses `ON CONFLICT DO NOTHING` for deduplication
 
+### Resilient Storage Connection
+Storage automatically reconnects to the destination database on transient errors (ConnectionRefused, ConnectionResetByPeer, BrokenPipe, UnexpectedEndOfData). When `persistChanges()` encounters a transient error, it:
+1. Closes the dead connection
+2. Waits with exponential backoff (100ms, 200ms, 400ms)
+3. Opens a fresh TCP+auth connection to the destination
+4. Re-runs migrations (idempotent)
+5. Retries the INSERT (up to 3 attempts total)
+
+This is transparent to callers — the main replication loop continues without crashing.
+
 ## Directory Structure
 
 ```
@@ -316,10 +328,10 @@ The `core/` and `worker/` directories contain the original TypeScript/Node.js co
 - Full CI pipeline with cross-compilation, E2E (MD5 + SCRAM + SSL), Docker, and release automation
 - Docusaurus documentation (5 Zemi pages + updated site config)
 - Rename from Bemi to Zemi throughout
+- Resilient storage connection with automatic reconnection on transient failures
 
 ### Potential Future Work
 - **Observability/metrics** — Prometheus endpoint for monitoring
-- **Connection pooling for storage** — currently single connection
 
 ## How to Work on This Codebase
 

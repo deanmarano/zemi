@@ -1,6 +1,7 @@
 const std = @import("std");
 const Connection = @import("connection.zig").Connection;
-const Config = @import("config.zig").Config;
+const config_mod = @import("config.zig");
+const Config = config_mod.Config;
 const decoder = @import("decoder.zig");
 const protocol = @import("protocol.zig");
 
@@ -8,9 +9,15 @@ const log = std.log.scoped(.storage);
 
 /// Manages a write connection to the destination PostgreSQL database
 /// for persisting decoded Change records into the `changes` table.
+///
+/// The connection is resilient: if a transient error occurs during
+/// `persistChanges()`, the dead connection is closed and a fresh one
+/// is established before retrying the write. This avoids crashing the
+/// replication loop on temporary network issues or PostgreSQL restarts.
 pub const Storage = struct {
     conn: Connection,
     allocator: std.mem.Allocator,
+    config: Config,
 
     pub const StorageError = Connection.ConnectError;
 
@@ -29,6 +36,7 @@ pub const Storage = struct {
                 config.getDestSslRootCert(),
             ),
             .allocator = allocator,
+            .config = config,
         };
 
         storage.runMigrations() catch |err| {
@@ -42,6 +50,34 @@ pub const Storage = struct {
 
     pub fn deinit(self: *Storage) void {
         self.conn.close();
+    }
+
+    /// Close the current connection and open a fresh one.
+    /// Re-runs migrations (idempotent) to ensure the schema is ready.
+    /// Used by persistChanges() after a transient connection failure.
+    fn reconnect(self: *Storage) StorageError!void {
+        log.info("reconnecting to destination database...", .{});
+        self.conn.close();
+
+        self.conn = try Connection.connect(
+            self.allocator,
+            self.config.getDestHost(),
+            self.config.getDestPort(),
+            self.config.getDestUser(),
+            self.config.getDestPassword(),
+            self.config.getDestName(),
+            null,
+            self.config.getDestSslMode(),
+            self.config.getDestSslRootCert(),
+        );
+
+        self.runMigrations() catch |err| {
+            log.err("failed to run migrations after reconnect: {}", .{err});
+            self.conn.close();
+            return err;
+        };
+
+        log.info("reconnected to destination database", .{});
     }
 
     // ========================================================================
@@ -105,6 +141,8 @@ pub const Storage = struct {
     /// Persist a batch of changes (typically one transaction's worth).
     /// Uses a multi-row INSERT with ON CONFLICT DO NOTHING for idempotency.
     /// Retries transient failures up to max_retries times with exponential backoff.
+    /// On transient errors, the connection is closed and re-established before
+    /// retrying, since the old connection is likely dead.
     /// Returns the number of rows actually inserted.
     pub fn persistChanges(self: *Storage, changes: []const decoder.Change) StorageError!usize {
         if (changes.len == 0) return 0;
@@ -118,7 +156,7 @@ pub const Storage = struct {
 
         log.debug("executing INSERT for {d} changes ({d} bytes)", .{ changes.len, sql.len });
 
-        // Retry transient failures (network errors, connection drops)
+        // Retry transient failures with reconnection
         const max_retries: u32 = 3;
         var attempt: u32 = 0;
         while (true) {
@@ -129,10 +167,18 @@ pub const Storage = struct {
                     return err;
                 }
                 const backoff_ms: u64 = @as(u64, 100) * (@as(u64, 1) << @min(attempt, 4));
-                log.warn("transient write error (attempt {d}/{d}): {}, retrying in {d}ms...", .{
+                log.warn("transient write error (attempt {d}/{d}): {}, reconnecting in {d}ms...", .{
                     attempt, max_retries, err, backoff_ms,
                 });
                 std.time.sleep(backoff_ms * std.time.ns_per_ms);
+
+                // Reconnect before retrying — the old connection is likely dead
+                self.reconnect() catch |reconnect_err| {
+                    log.err("reconnection failed (attempt {d}/{d}): {}", .{
+                        attempt, max_retries, reconnect_err,
+                    });
+                    // Continue loop; next iteration will try reconnect again or give up
+                };
                 continue;
             };
             defer result.deinit();
@@ -448,6 +494,7 @@ test "buildInsertSql produces valid SQL for single change" {
     var storage = Storage{
         .conn = undefined,
         .allocator = allocator,
+        .config = Config{},
     };
 
     const sql = try storage.buildInsertSql(&changes);
@@ -489,6 +536,7 @@ test "buildInsertSql uses change.context when present" {
     var storage = Storage{
         .conn = undefined,
         .allocator = allocator,
+        .config = Config{},
     };
 
     const sql = try storage.buildInsertSql(&changes);
@@ -533,6 +581,7 @@ test "buildInsertSql uses empty context when null" {
     var storage = Storage{
         .conn = undefined,
         .allocator = allocator,
+        .config = Config{},
     };
 
     const sql = try storage.buildInsertSql(&changes);

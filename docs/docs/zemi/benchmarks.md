@@ -106,5 +106,64 @@ Zemi has zero runtime dependencies. Copy the binary to any Linux machine and run
 | Docker image | 3.23 GB | 1.04 MB | 3,100x |
 | Memory | 300–500 MB | 2.8 MB | ~150x |
 | Startup | 30–60 s | &lt;1 ms | &gt;30,000x |
+| Throughput | ~90 changes/s | ~10,000 changes/s | ~100x |
+| Latency (p50) | ~9,000 ms | ~115 ms | ~80x |
 | Processes | 4+ | 1 | 4x |
 | Dependencies | 7+ | 0 | -- |
+
+## Change Tracking Throughput
+
+Measured end-to-end: time from all data written to source PostgreSQL until all changes appear in the destination `changes` table. Both trackers ran against the same PostgreSQL 16 instances on the same machine.
+
+### Sustained INSERTs
+
+| Metric | Zemi | Original Bemi |
+|--------|------|---------------|
+| **Throughput** | **~10,000 changes/s** | ~90 changes/s |
+| Time (1,000 rows) | 72 ms | 10,835 ms |
+| Changes captured | 1,000/1,000 | 1,000/1,000 |
+
+### Mixed Operations (INSERT + UPDATE + DELETE)
+
+| Metric | Zemi | Original Bemi |
+|--------|------|---------------|
+| **Throughput** | **~5,700 changes/s** | ~90 changes/s |
+| Time (400 changes) | 70 ms | 4,331 ms |
+| Changes captured | 400/400 | 400/400 |
+
+### Large Transactions (bulk inserts)
+
+| Metric | Zemi | Original Bemi |
+|--------|------|---------------|
+| **Throughput** | **~7,600 changes/s** | ~90 changes/s |
+| Time (600 rows in 3 txns) | 79 ms | 6,640 ms |
+| Changes captured | 600/600 | 600/600 |
+
+### End-to-End Latency
+
+Time from a single INSERT on the source to the corresponding change appearing in the destination.
+
+| Percentile | Zemi | Original Bemi |
+|------------|------|---------------|
+| **p50** | **113 ms** | ~9,000 ms |
+| p95 | 118 ms | N/A |
+| p99 | 118 ms | N/A |
+
+Bemi's latency is dominated by its internal polling interval (~10 seconds). Most single-row latency samples time out at the 10-second per-sample deadline.
+
+### How we measured
+
+```bash
+# Start benchmark PostgreSQL instances (source on 5440, dest on 5441)
+docker compose -f docker-compose.benchmark.yml up -d
+
+# Build and run all scenarios
+./test/benchmark.sh
+
+# Or run Zemi-only (skip Bemi comparison)
+./test/benchmark.sh --zemi-only
+```
+
+The benchmark script (`test/benchmark.sh`) runs each tracker through 4 scenarios: sustained inserts, mixed operations, large transactions, and per-row latency measurement. Each scenario uses `TRUNCATE` between runs to reset state without breaking replication tracking. A canary insert verifies the tracker is actively streaming before each benchmark begins.
+
+**Note**: Bemi runs under Rosetta 2 emulation on Apple Silicon (the Docker image is linux/amd64 only), which adds overhead. On native x86_64 hardware, Bemi performance would be somewhat better. Zemi runs as a native binary in all cases.

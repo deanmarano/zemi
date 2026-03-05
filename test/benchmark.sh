@@ -72,10 +72,10 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-log()  { echo -e "${BLUE}[bench]${NC} $*"; }
-ok()   { echo -e "${GREEN}[bench]${NC} $*"; }
-warn() { echo -e "${YELLOW}[bench]${NC} $*"; }
-err()  { echo -e "${RED}[bench]${NC} $*"; }
+log()  { echo -e "${BLUE}[bench]${NC} $*" >&2; }
+ok()   { echo -e "${GREEN}[bench]${NC} $*" >&2; }
+warn() { echo -e "${YELLOW}[bench]${NC} $*" >&2; }
+err()  { echo -e "${RED}[bench]${NC} $*" >&2; }
 
 psql_source() {
   PGPASSWORD="$DB_PASSWORD" psql -h "$SOURCE_HOST" -p "$SOURCE_PORT" -U "$DB_USER" -d "$SOURCE_DB" -t -A "$@"
@@ -122,28 +122,67 @@ cleanup_all() {
   # Wait briefly for PG to detect disconnected replication clients
   sleep 1
   # Drop only inactive replication slots (active slots would block forever)
-  psql_source -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name IN ('bench_zemi', 'bemi_local') AND NOT active;" 2>/dev/null || true
-  psql_source -c "DROP PUBLICATION IF EXISTS bench_zemi;" 2>/dev/null || true
-  psql_source -c "DROP PUBLICATION IF EXISTS bemi_local;" 2>/dev/null || true
-  psql_source -c "DROP PUBLICATION IF EXISTS dbz_publication;" 2>/dev/null || true
+  psql_source -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name IN ('bench_zemi', 'bemi_local') AND NOT active;" > /dev/null 2>&1 || true
+  psql_source -c "DROP PUBLICATION IF EXISTS bench_zemi;" > /dev/null 2>&1 || true
+  psql_source -c "DROP PUBLICATION IF EXISTS bemi_local;" > /dev/null 2>&1 || true
+  psql_source -c "DROP PUBLICATION IF EXISTS dbz_publication;" > /dev/null 2>&1 || true
 }
 
 trap cleanup_all EXIT
 
-# Reset the test tables and changes table between runs
-reset_tables() {
-  log "Resetting tables..."
-  psql_source -c "DROP TABLE IF EXISTS bench_items CASCADE;" 2>/dev/null || true
-  psql_source -c "CREATE TABLE bench_items (
+# Create the bench_items table if it doesn't exist
+create_bench_table() {
+  psql_source -c "CREATE TABLE IF NOT EXISTS bench_items (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     value INTEGER NOT NULL DEFAULT 0,
     data TEXT,
     created_at TIMESTAMP DEFAULT NOW()
-  );"
-  psql_source -c "ALTER TABLE bench_items REPLICA IDENTITY FULL;"
-  # Clean destination changes table
-  psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" 2>/dev/null || true
+  );" > /dev/null
+  psql_source -c "ALTER TABLE bench_items REPLICA IDENTITY FULL;" > /dev/null
+}
+
+# Reset the test tables and changes table between scenarios.
+# Uses TRUNCATE instead of DROP/CREATE to avoid breaking Debezium's table tracking.
+reset_tables() {
+  log "Resetting tables..."
+  psql_source -c "TRUNCATE bench_items RESTART IDENTITY;" > /dev/null 2>&1 || true
+  # Wait briefly for any TRUNCATE WAL events to propagate
+  sleep 1
+  # Clean destination changes table (removes all bench_items changes including TRUNCATE events)
+  psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" > /dev/null 2>&1 || true
+}
+
+# Verify a tracker is actually streaming by inserting a canary row and waiting for it
+verify_tracker_streaming() {
+  local tracker="$1"
+  local timeout_secs="${2:-30}"
+  log "[$tracker] Verifying tracker is streaming (canary insert)..."
+
+  # Insert a canary row
+  psql_source -c "INSERT INTO bench_items (name, value) VALUES ('__canary__', 0);" > /dev/null
+
+  # Wait for the canary to appear in the changes table
+  local waited=0
+  while [[ $waited -lt $timeout_secs ]]; do
+    local found
+    found=$(psql_dest -c "SELECT COUNT(*) FROM changes WHERE \"table\" = 'bench_items' AND after::text LIKE '%__canary__%';" 2>/dev/null || echo "0")
+    found="${found//[[:space:]]/}"
+    if [[ "$found" -ge 1 ]]; then
+      ok "[$tracker] Tracker is streaming (canary detected in ${waited}s)"
+      # Clean up canary row and reset for benchmarks
+      psql_source -c "TRUNCATE bench_items RESTART IDENTITY;" > /dev/null
+      # Wait for TRUNCATE WAL event to propagate, then wipe dest changes
+      sleep 2
+      psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" > /dev/null 2>&1 || true
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  err "[$tracker] Tracker is NOT streaming after ${timeout_secs}s — canary not detected"
+  return 1
 }
 
 # Wait until the expected number of changes appear in the destination
@@ -289,7 +328,7 @@ run_sustained_inserts() {
       i,
       repeat('x', 100)
     FROM generate_series(1, $count) AS i;
-  "
+  " > /dev/null
 
   local gen_end
   gen_end=$(now_ms)
@@ -335,18 +374,18 @@ run_mixed_ops() {
     INSERT INTO bench_items (name, value, data)
     SELECT 'item-' || i, i, repeat('x', 50)
     FROM generate_series(1, $count) AS i;
-  "
+  " > /dev/null
 
   # Phase 2: Update half of them
   psql_source -c "
     UPDATE bench_items SET value = value + 1000, data = repeat('y', 50)
     WHERE id <= $count / 2;
-  "
+  " > /dev/null
 
   # Phase 3: Delete the other half
   psql_source -c "
     DELETE FROM bench_items WHERE id > $count / 2;
-  "
+  " > /dev/null
 
   local gen_end
   gen_end=$(now_ms)
@@ -409,7 +448,7 @@ run_large_txns() {
       SELECT 'txn${i}-item-' || j, j, repeat('z', 200)
       FROM generate_series(1, $rows) AS j;
       COMMIT;
-    "
+    " > /dev/null
   done
 
   local gen_end
@@ -456,11 +495,11 @@ run_latency() {
     local insert_time
     insert_time=$(now_ms)
 
-    psql_source -c "INSERT INTO bench_items (name, value) VALUES ('latency-$i', $i);"
+    psql_source -c "INSERT INTO bench_items (name, value) VALUES ('latency-$i', $i);" > /dev/null
 
     # Poll for this specific change with a short timeout
     local found=false
-    local deadline=$((insert_time + 10000))  # 10 second timeout per row
+    local deadline=$((insert_time + 30000))  # 30 second timeout per row (Bemi polls every ~10s)
     while true; do
       local change_exists
       change_exists=$(psql_dest -c "SELECT COUNT(*) FROM changes WHERE \"table\" = 'bench_items' AND after::text LIKE '%latency-$i%';" 2>/dev/null)
@@ -534,17 +573,17 @@ run_benchmarks() {
   if [[ -z "$SCENARIO_FILTER" || "$SCENARIO_FILTER" == "inserts" ]]; then
     run_sustained_inserts "$tracker" "$result_file"
     # Clean up between scenarios
-    psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" 2>/dev/null || true
+    psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" > /dev/null 2>&1 || true
   fi
 
   if [[ -z "$SCENARIO_FILTER" || "$SCENARIO_FILTER" == "mixed" ]]; then
     run_mixed_ops "$tracker" "$result_file"
-    psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" 2>/dev/null || true
+    psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" > /dev/null 2>&1 || true
   fi
 
   if [[ -z "$SCENARIO_FILTER" || "$SCENARIO_FILTER" == "large-txn" ]]; then
     run_large_txns "$tracker" "$result_file"
-    psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" 2>/dev/null || true
+    psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" > /dev/null 2>&1 || true
   fi
 
   if [[ -z "$SCENARIO_FILTER" || "$SCENARIO_FILTER" == "latency" ]]; then
@@ -560,7 +599,7 @@ get_result() {
   local default="${3:-N/A}"
   if [[ -f "$file" ]]; then
     local val
-    val=$(grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2)
+    val=$(grep "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2)
     echo "${val:-$default}"
   else
     echo "$default"
@@ -722,6 +761,13 @@ main() {
     zig build 2>&1
   fi
 
+  # Create the bench table once (used by both trackers)
+  create_bench_table
+
+  # Ensure Zemi starts with a clean changes table (Bemi may have left its own schema)
+  psql_dest -c "DROP TABLE IF EXISTS _bemi_migrations CASCADE;" > /dev/null 2>&1 || true
+  psql_dest -c "DROP TABLE IF EXISTS changes CASCADE;" > /dev/null 2>&1 || true
+
   # ── Run Zemi benchmarks ──
   echo ""
   echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -729,13 +775,14 @@ main() {
   echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
   start_zemi "bench_zemi" "bench_zemi"
+  verify_tracker_streaming "zemi" 15
   run_benchmarks "zemi" "$ZEMI_RESULTS"
   cleanup_tracker "zemi"
 
   # Clean up Zemi's replication slot and publication
   sleep 1
-  psql_source -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'bench_zemi' AND NOT active;" 2>/dev/null || true
-  psql_source -c "DROP PUBLICATION IF EXISTS bench_zemi;" 2>/dev/null || true
+  psql_source -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'bench_zemi' AND NOT active;" > /dev/null 2>&1 || true
+  psql_source -c "DROP PUBLICATION IF EXISTS bench_zemi;" > /dev/null 2>&1 || true
 
   # ── Run Bemi benchmarks ──
   if [[ "$ZEMI_ONLY" != "true" ]]; then
@@ -744,18 +791,27 @@ main() {
     echo -e "${BOLD}  Running benchmarks: BEMI${NC}"
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
+    # Drop Zemi's changes table AND Bemi's migration table for a clean Bemi start.
+    # Bemi uses MikroORM migrations that only run if _bemi_migrations is missing/incomplete.
+    psql_dest -c "DROP TABLE IF EXISTS _bemi_migrations CASCADE;" > /dev/null 2>&1 || true
+    psql_dest -c "DROP TABLE IF EXISTS changes CASCADE;" > /dev/null 2>&1 || true
+
+    # Ensure bench_items exists (Bemi needs it in the publication from the start)
+    create_bench_table
+
     # Pull Bemi image if needed
     log "Pulling Bemi image..."
     docker pull "$BEMI_IMAGE" 2>/dev/null || warn "Failed to pull Bemi image (may use cached)"
 
     start_bemi
+    verify_tracker_streaming "bemi" 60
     run_benchmarks "bemi" "$BEMI_RESULTS"
     cleanup_tracker "bemi"
 
     # Clean up Bemi's replication slot and publication
     sleep 1
-    psql_source -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'bemi_local' AND NOT active;" 2>/dev/null || true
-    psql_source -c "DROP PUBLICATION IF EXISTS dbz_publication;" 2>/dev/null || true
+    psql_source -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'bemi_local' AND NOT active;" > /dev/null 2>&1 || true
+    psql_source -c "DROP PUBLICATION IF EXISTS dbz_publication;" > /dev/null 2>&1 || true
   fi
 
   # ── Print results ──

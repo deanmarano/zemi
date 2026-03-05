@@ -206,6 +206,11 @@ pub const Connection = struct {
 
         self.tls_client = tls.Client.init(self.stream, options) catch |err| {
             log.err("TLS handshake failed: {}", .{err});
+            // Clean up CA bundle on handshake failure to prevent memory leak
+            if (self.ca_bundle) |*bundle| {
+                bundle.deinit(self.allocator);
+                self.ca_bundle = null;
+            }
             return error.ConnectionRefused;
         };
 

@@ -599,6 +599,7 @@ ssl_cleanup() {
         wait "$SSL_ZEMI_PID" 2>/dev/null || true
     fi
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SELECT pg_drop_replication_slot('zemi_ssl_test');" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SELECT pg_drop_replication_slot('zemi_ssl_verify');" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP PUBLICATION IF EXISTS zemi_ssl_pub;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP TABLE IF EXISTS ssl_test_items CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
@@ -673,6 +674,12 @@ if [ "$SSL_AVAILABLE" = true ]; then
         fi
         SSL_ZEMI_PID=""
 
+        # Drop the replication slot between 13a and 13b so 13b doesn't
+        # pick up stale WAL events (DELETEs from cleanup) via the old slot position.
+        # Wait briefly for PostgreSQL to fully release the slot after Zemi exits.
+        sleep 1
+        PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SELECT pg_drop_replication_slot('zemi_ssl_test');" 2>/dev/null || true
+
         # --- Test 13b: sslmode=verify-ca with root cert ---
         echo "  $(bold "13b: sslmode=verify-ca")"
 
@@ -693,7 +700,7 @@ if [ "$SSL_AVAILABLE" = true ]; then
             DB_PORT="$SSL_PORT" \
             DB_SSL_MODE="verify-ca" \
             DB_SSL_ROOT_CERT="$SSL_CERT_DIR/root.crt" \
-            SLOT_NAME="zemi_ssl_test" \
+            SLOT_NAME="zemi_ssl_verify" \
             PUBLICATION_NAME="zemi_ssl_pub" \
             "$ZEMI_BIN" > /tmp/zemi-e2e-ssl-verify.log 2>&1 &
             SSL_ZEMI_PID=$!
@@ -707,13 +714,13 @@ if [ "$SSL_AVAILABLE" = true ]; then
 
                 SSL_ELAPSED=0
                 while [ "$SSL_ELAPSED" -lt 15 ]; do
-                    SSL_COUNT=$(ssl_query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'ssl_test_items';" 2>/dev/null || echo "0")
+                    SSL_COUNT=$(ssl_query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'ssl_test_items' AND operation = 'CREATE' AND after->>'name' = 'ssl-verify-ca-item';" 2>/dev/null || echo "0")
                     if [ "$SSL_COUNT" -ge 1 ]; then break; fi
                     sleep 1
                     SSL_ELAPSED=$((SSL_ELAPSED + 1))
                 done
 
-                SSL_VERIFY_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;" || echo "")
+                SSL_VERIFY_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' AND after->>'name' = 'ssl-verify-ca-item' LIMIT 1;" || echo "")
                 assert_eq "SSL verify-ca: INSERT tracked" "CREATE" "$SSL_VERIFY_OP"
             else
                 echo "  $(red "FAIL") Zemi failed to start with SSL (verify-ca)"

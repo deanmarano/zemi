@@ -3,13 +3,14 @@ import type { Config } from "@docusaurus/types";
 import type * as Preset from "@docusaurus/preset-classic";
 
 const config: Config = {
-  title: "Bemi",
-  tagline: "Automatic database change tracking",
+  title: "Zemi",
+  tagline: "Automatic PostgreSQL change tracking",
   favicon: "img/favicon.ico",
-  url: "https://docs.bemi.io",
-  baseUrl: "/",
-  organizationName: "BemiHQ",
-  projectName: "bemi",
+  url: "https://deanmarano.github.io",
+  baseUrl: "/zemi/",
+  organizationName: "deanmarano",
+  projectName: "zemi",
+  trailingSlash: false,
   onBrokenLinks: "throw",
   onBrokenMarkdownLinks: "warn",
 
@@ -40,7 +41,7 @@ const config: Config = {
         docs: {
           routeBasePath: "/",
           sidebarPath: "./sidebars.ts",
-          editUrl: "https://github.com/BemiHQ/bemi-io/tree/main/docs/",
+          editUrl: "https://github.com/deanmarano/zemi/tree/main/docs/",
         },
         blog: false,
         theme: {
@@ -78,7 +79,7 @@ const config: Config = {
           position: "left",
         },
         {
-          href: "https://github.com/BemiHQ/bemi-io",
+          href: "https://github.com/deanmarano/zemi",
           label: "GitHub",
           position: "right",
         },
@@ -142,7 +143,7 @@ const config: Config = {
           items: [
             {
               label: "GitHub",
-              href: "https://github.com/BemiHQ/bemi-io",
+              href: "https://github.com/deanmarano/zemi",
             },
             {
               label: "Discord",
@@ -155,23 +156,23 @@ const config: Config = {
           items: [
             {
               label: "Overview",
-              to: "/zemi",
+              href: "/zemi/zemi",
             },
             {
               label: "Benchmarks",
-              to: "/zemi/benchmarks",
+              href: "/zemi/zemi/benchmarks",
             },
             {
               label: "Architecture",
-              to: "/zemi/architecture",
+              href: "/zemi/zemi/architecture",
             },
             {
               label: "Configuration",
-              to: "/zemi/configuration",
+              href: "/zemi/zemi/configuration",
             },
             {
               label: "Migration Guide",
-              to: "/zemi/migration",
+              href: "/zemi/zemi/migration",
             },
           ],
         },

@@ -178,14 +178,14 @@ Run with `zig build test`. All tests are pulled in via `src/main.zig`'s test blo
 
 **Important**: Zig's test runner treats `log.err` calls as test failures. Error-path tests must use `log.warn` instead.
 
-### E2E Integration Tests (33 assertions, 12 test groups)
+### E2E Integration Tests (35 assertions, 13 test groups)
 
 Run with `./test/e2e.sh` (uses Docker Compose) or `./test/e2e.sh --no-docker` (expects PostgreSQL already running on ports 5433, 5434, and 5435).
 
 The test script:
 1. Starts three PostgreSQL 16 instances: MD5 (port 5433), SCRAM-SHA-256 (port 5434), and SSL-enabled (port 5435)
 2. Builds Zemi from source
-3. Runs 12 test groups covering: connection, INSERT/UPDATE/DELETE/TRUNCATE tracking, data correctness, table filtering, context stitching, graceful shutdown cleanup, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca)
+3. Runs 13 test groups covering: connection, INSERT/UPDATE/DELETE/TRUNCATE tracking, data correctness, table filtering, context stitching, storage reconnection on DB restart, graceful shutdown cleanup, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca)
 4. Each test starts Zemi as a background process, performs SQL operations, waits, then queries the `changes` table
 
 **`docker-compose.test.yml`** — three PostgreSQL 16 Alpine services:
@@ -324,7 +324,7 @@ The `core/` and `worker/` directories contain the original TypeScript/Node.js co
 - SSL/TLS support (`src/connection.zig` — SSLRequest negotiation, TLS handshake, TLS-aware I/O wrappers)
 - SSL configuration (`src/config.zig` — `SslMode` enum, `DB_SSL_MODE`, `DB_SSL_ROOT_CERT`, dest fallbacks)
 - Graceful shutdown with slot/publication cleanup (`CLEANUP_ON_SHUTDOWN` env var, `replication.dropSlot()` + `replication.dropPublication()` via normal connections)
-- E2E integration tests (33 assertions across 12 test groups including SCRAM, SSL, and graceful shutdown cleanup)
+- E2E integration tests (35 assertions across 13 test groups including reconnection, SCRAM, SSL, and graceful shutdown cleanup)
 - Full CI pipeline with cross-compilation, E2E (MD5 + SCRAM + SSL), Docker, and release automation
 - Docusaurus documentation (5 Zemi pages + updated site config)
 - Rename from Bemi to Zemi throughout

@@ -360,10 +360,83 @@ TRUNC_PK=$(query "SELECT primary_key FROM changes WHERE operation = 'TRUNCATE' A
 assert_eq "primary_key is empty for TRUNCATE" "" "$TRUNC_PK"
 
 # ---------------------------------------------------------------------------
-# Test 10: Graceful shutdown cleanup (CLEANUP_ON_SHUTDOWN)
+# Test 10: Storage reconnection on destination DB restart
 # ---------------------------------------------------------------------------
 echo ""
-echo "$(bold "[Test 10] Graceful shutdown cleanup")"
+echo "$(bold "[Test 10] Storage reconnection")"
+
+if [ "$USE_DOCKER" = true ]; then
+    # Record how many changes exist before the restart test
+    RECONNECT_BEFORE=$(query "SELECT COUNT(*) FROM changes;")
+
+    # Insert a row before restart to confirm Zemi is healthy
+    query "INSERT INTO test_users (name, email) VALUES ('PreRestart', 'pre@restart.com');"
+    wait_for_changes $((RECONNECT_BEFORE + 1))
+
+    RECONNECT_MID=$(query "SELECT COUNT(*) FROM changes;")
+    assert_eq "reconnect: change tracked before restart" "$((RECONNECT_BEFORE + 1))" "$RECONNECT_MID"
+
+    # Restart the PostgreSQL container (source + destination are the same DB)
+    log "Restarting PostgreSQL container to test storage reconnection..."
+    POSTGRES_CONTAINER=$(docker ps --format '{{.ID}} {{.Ports}}' | grep '5433->5432' | awk '{print $1}')
+    docker restart "$POSTGRES_CONTAINER" > /dev/null 2>&1
+
+    # Wait for PostgreSQL to accept connections again
+    RECONNECT_ELAPSED=0
+    while [ "$RECONNECT_ELAPSED" -lt 30 ]; do
+        if PGPASSWORD="$DB_PASSWORD" $PSQL -c "SELECT 1;" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        RECONNECT_ELAPSED=$((RECONNECT_ELAPSED + 1))
+    done
+
+    if [ "$RECONNECT_ELAPSED" -ge 30 ]; then
+        echo "  $(red "FAIL") PostgreSQL did not come back after restart"
+        FAIL=$((FAIL + 1))
+        TOTAL=$((TOTAL + 1))
+    else
+        log "PostgreSQL is back after ${RECONNECT_ELAPSED}s, waiting for Zemi to recover..."
+
+        # Give Zemi time to detect the broken connection and reconnect
+        sleep 5
+
+        # Verify Zemi is still running (didn't crash)
+        if kill -0 "$ZEMI_PID" 2>/dev/null; then
+            assert_eq "reconnect: Zemi still running after DB restart" "running" "running"
+
+            # Insert a row after restart
+            query "INSERT INTO test_users (name, email) VALUES ('PostRestart', 'post@restart.com');"
+
+            # Wait for Zemi to reconnect and track the change (allow extra time)
+            RECONNECT_ELAPSED=0
+            RECONNECT_EXPECTED=$((RECONNECT_MID + 1))
+            while [ "$RECONNECT_ELAPSED" -lt 30 ]; do
+                RECONNECT_COUNT=$(query "SELECT COUNT(*) FROM changes;" 2>/dev/null || echo "0")
+                if [ "$RECONNECT_COUNT" -ge "$RECONNECT_EXPECTED" ]; then break; fi
+                sleep 1
+                RECONNECT_ELAPSED=$((RECONNECT_ELAPSED + 1))
+            done
+
+            RECONNECT_OP=$(query "SELECT operation FROM changes WHERE after->>'name' = 'PostRestart' LIMIT 1;")
+            assert_eq "reconnect: change tracked after DB restart" "CREATE" "$RECONNECT_OP"
+        else
+            echo "  $(red "FAIL") Zemi crashed after DB restart"
+            echo "  --- Zemi logs (last 30 lines):"
+            tail -30 /tmp/zemi-e2e.log
+            FAIL=$((FAIL + 2))
+            TOTAL=$((TOTAL + 2))
+        fi
+    fi
+else
+    echo "  SKIP: reconnection test requires Docker (use without --no-docker)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11: Graceful shutdown cleanup (CLEANUP_ON_SHUTDOWN)
+# ---------------------------------------------------------------------------
+echo ""
+echo "$(bold "[Test 11] Graceful shutdown cleanup")"
 
 CLEANUP_SLOT="zemi_cleanup_test"
 CLEANUP_PUB="zemi_cleanup_pub"
@@ -422,10 +495,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 11: SCRAM-SHA-256 authentication
+# Test 12: SCRAM-SHA-256 authentication
 # ---------------------------------------------------------------------------
 echo ""
-echo "$(bold "[Test 11] SCRAM-SHA-256 authentication")"
+echo "$(bold "[Test 12] SCRAM-SHA-256 authentication")"
 
 SCRAM_PORT="${SCRAM_PORT:-5434}"
 SCRAM_PSQL="psql -h $DB_HOST -p $SCRAM_PORT -U $DB_USER -d $DB_NAME -X -q"
@@ -488,10 +561,10 @@ if [ "$SCRAM_AVAILABLE" = true ]; then
             SCRAM_ELAPSED=$((SCRAM_ELAPSED + 1))
         done
 
-        SCRAM_OP=$(scram_query "SELECT operation FROM changes WHERE \"table\" = 'scram_test_items' LIMIT 1;")
+        SCRAM_OP=$(scram_query "SELECT operation FROM changes WHERE \"table\" = 'scram_test_items' LIMIT 1;" || echo "")
         assert_eq "SCRAM: INSERT tracked as CREATE" "CREATE" "$SCRAM_OP"
 
-        SCRAM_AFTER=$(scram_query "SELECT after->>'name' FROM changes WHERE \"table\" = 'scram_test_items' LIMIT 1;")
+        SCRAM_AFTER=$(scram_query "SELECT after->>'name' FROM changes WHERE \"table\" = 'scram_test_items' LIMIT 1;" || echo "")
         assert_eq "SCRAM: after contains inserted data" "scram-test-item" "$SCRAM_AFTER"
     else
         echo "  $(red "FAIL") Zemi failed to start with SCRAM-SHA-256"
@@ -507,10 +580,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 12: SSL/TLS connection (sslmode=require)
+# Test 13: SSL/TLS connection (sslmode=require)
 # ---------------------------------------------------------------------------
 echo ""
-echo "$(bold "[Test 12] SSL/TLS connection")"
+echo "$(bold "[Test 13] SSL/TLS connection")"
 
 SSL_PORT="${SSL_PORT:-5435}"
 SSL_PSQL="psql -h $DB_HOST -p $SSL_PORT -U $DB_USER -d $DB_NAME -X -q"
@@ -554,8 +627,8 @@ if [ "$SSL_AVAILABLE" = true ]; then
         ssl_query "CREATE TABLE ssl_test_items (id SERIAL PRIMARY KEY, name TEXT NOT NULL);"
         ssl_query "CREATE PUBLICATION zemi_ssl_pub FOR TABLE ssl_test_items;"
 
-        # --- Test 12a: sslmode=require (no cert verification) ---
-        echo "  $(bold "12a: sslmode=require")"
+        # --- Test 13a: sslmode=require (no cert verification) ---
+        echo "  $(bold "13a: sslmode=require")"
 
         DB_PORT="$SSL_PORT" \
         DB_SSL_MODE="require" \
@@ -580,10 +653,10 @@ if [ "$SSL_AVAILABLE" = true ]; then
                 SSL_ELAPSED=$((SSL_ELAPSED + 1))
             done
 
-            SSL_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;")
+            SSL_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;" || echo "")
             assert_eq "SSL: INSERT tracked as CREATE" "CREATE" "$SSL_OP"
 
-            SSL_AFTER=$(ssl_query "SELECT after->>'name' FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;")
+            SSL_AFTER=$(ssl_query "SELECT after->>'name' FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;" || echo "")
             assert_eq "SSL: after contains inserted data" "ssl-test-item" "$SSL_AFTER"
         else
             echo "  $(red "FAIL") Zemi failed to start with SSL (require)"
@@ -600,8 +673,8 @@ if [ "$SSL_AVAILABLE" = true ]; then
         fi
         SSL_ZEMI_PID=""
 
-        # --- Test 12b: sslmode=verify-ca with root cert ---
-        echo "  $(bold "12b: sslmode=verify-ca")"
+        # --- Test 13b: sslmode=verify-ca with root cert ---
+        echo "  $(bold "13b: sslmode=verify-ca")"
 
         # Extract the CA certificate from the SSL container
         SSL_CERT_DIR="/tmp/zemi-ssl-certs"
@@ -613,9 +686,9 @@ if [ "$SSL_AVAILABLE" = true ]; then
         fi
 
         if [ -f "$SSL_CERT_DIR/root.crt" ]; then
-            # Clean up changes from 12a
-            ssl_query "DELETE FROM changes;"
-            ssl_query "DELETE FROM ssl_test_items;"
+            # Clean up changes from 13a (may not exist if Zemi couldn't connect)
+            ssl_query "DELETE FROM changes;" 2>/dev/null || true
+            ssl_query "DELETE FROM ssl_test_items;" 2>/dev/null || true
 
             DB_PORT="$SSL_PORT" \
             DB_SSL_MODE="verify-ca" \
@@ -640,7 +713,7 @@ if [ "$SSL_AVAILABLE" = true ]; then
                     SSL_ELAPSED=$((SSL_ELAPSED + 1))
                 done
 
-                SSL_VERIFY_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;")
+                SSL_VERIFY_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' LIMIT 1;" || echo "")
                 assert_eq "SSL verify-ca: INSERT tracked" "CREATE" "$SSL_VERIFY_OP"
             else
                 echo "  $(red "FAIL") Zemi failed to start with SSL (verify-ca)"

@@ -10,6 +10,8 @@
 # Usage:
 #   ./test/benchmark.sh                    # Full benchmark (requires Docker)
 #   ./test/benchmark.sh --zemi-only        # Skip Bemi comparison
+#   ./test/benchmark.sh --bemi-only        # Skip Zemi comparison
+#   ./test/benchmark.sh --summary-only     # Only print results from previous runs
 #   ./test/benchmark.sh --scenario=inserts # Run specific scenario
 #
 # Prerequisites:
@@ -39,6 +41,8 @@ LATENCY_SAMPLE_COUNT="${LATENCY_SAMPLE_COUNT:-100}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-120}"                   # seconds to wait for changes
 
 ZEMI_ONLY=false
+BEMI_ONLY=false
+SUMMARY_ONLY=false
 SCENARIO_FILTER=""
 SKIP_DOCKER=false
 NO_BUILD=false
@@ -56,6 +60,8 @@ BEMI_RESULTS="$RESULTS_DIR/bemi"
 for arg in "$@"; do
   case $arg in
     --zemi-only)     ZEMI_ONLY=true ;;
+    --bemi-only)     BEMI_ONLY=true ;;
+    --summary-only)  SUMMARY_ONLY=true ;;
     --scenario=*)    SCENARIO_FILTER="${arg#*=}" ;;
     --skip-docker)   SKIP_DOCKER=true ;;
     --no-build)      NO_BUILD=true ;;
@@ -116,6 +122,8 @@ cleanup_tracker() {
 }
 
 cleanup_all() {
+  # Skip cleanup in summary-only mode (no infrastructure to clean up)
+  if [[ "${SUMMARY_ONLY:-false}" == "true" ]]; then return 0; fi
   log "Cleaning up..."
   cleanup_tracker "zemi"
   cleanup_tracker "bemi"
@@ -737,6 +745,15 @@ EOF
 main() {
   mkdir -p "$RESULTS_DIR"
 
+  # ── Summary-only mode: skip all benchmarks, just format results ──
+  if [[ "$SUMMARY_ONLY" == "true" ]]; then
+    log "Summary-only mode: formatting results from previous runs..."
+    print_results
+    generate_summary
+    ok "Summary complete!"
+    return 0
+  fi
+
   # Start infrastructure
   if [[ "$SKIP_DOCKER" != "true" ]]; then
     log "Starting benchmark PostgreSQL instances..."
@@ -755,8 +772,8 @@ main() {
     sleep 1
   done
 
-  # Build Zemi
-  if [[ "$NO_BUILD" != "true" ]]; then
+  # Build Zemi (skip if --no-build or --bemi-only)
+  if [[ "$NO_BUILD" != "true" && "$BEMI_ONLY" != "true" ]]; then
     log "Building Zemi..."
     zig build 2>&1
   fi
@@ -764,25 +781,27 @@ main() {
   # Create the bench table once (used by both trackers)
   create_bench_table
 
-  # Ensure Zemi starts with a clean changes table (Bemi may have left its own schema)
-  psql_dest -c "DROP TABLE IF EXISTS _bemi_migrations CASCADE;" > /dev/null 2>&1 || true
-  psql_dest -c "DROP TABLE IF EXISTS changes CASCADE;" > /dev/null 2>&1 || true
-
   # ── Run Zemi benchmarks ──
-  echo ""
-  echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "${BOLD}  Running benchmarks: ZEMI${NC}"
-  echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  if [[ "$BEMI_ONLY" != "true" ]]; then
+    # Ensure Zemi starts with a clean changes table (Bemi may have left its own schema)
+    psql_dest -c "DROP TABLE IF EXISTS _bemi_migrations CASCADE;" > /dev/null 2>&1 || true
+    psql_dest -c "DROP TABLE IF EXISTS changes CASCADE;" > /dev/null 2>&1 || true
 
-  start_zemi "bench_zemi" "bench_zemi"
-  verify_tracker_streaming "zemi" 15
-  run_benchmarks "zemi" "$ZEMI_RESULTS"
-  cleanup_tracker "zemi"
+    echo ""
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}  Running benchmarks: ZEMI${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-  # Clean up Zemi's replication slot and publication
-  sleep 1
-  psql_source -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'bench_zemi' AND NOT active;" > /dev/null 2>&1 || true
-  psql_source -c "DROP PUBLICATION IF EXISTS bench_zemi;" > /dev/null 2>&1 || true
+    start_zemi "bench_zemi" "bench_zemi"
+    verify_tracker_streaming "zemi" 15
+    run_benchmarks "zemi" "$ZEMI_RESULTS"
+    cleanup_tracker "zemi"
+
+    # Clean up Zemi's replication slot and publication
+    sleep 1
+    psql_source -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'bench_zemi' AND NOT active;" > /dev/null 2>&1 || true
+    psql_source -c "DROP PUBLICATION IF EXISTS bench_zemi;" > /dev/null 2>&1 || true
+  fi
 
   # ── Run Bemi benchmarks ──
   if [[ "$ZEMI_ONLY" != "true" ]]; then

@@ -71,6 +71,7 @@ pub const Config = struct {
     // Operational settings
     shutdown_timeout_secs: u32 = 30,
     health_port: ?u16 = null, // null = health check disabled
+    metrics_port: ?u16 = null, // null = metrics endpoint disabled
     cleanup_on_shutdown: bool = false, // drop slot + publication on graceful shutdown
 
     /// Returns the effective destination host (falls back to source).
@@ -191,6 +192,13 @@ pub const Config = struct {
             };
         }
 
+        if (std.posix.getenv("METRICS_PORT")) |v| {
+            config.metrics_port = std.fmt.parseUnsigned(u16, v, 10) catch blk: {
+                log.warn("invalid METRICS_PORT '{s}', disabling metrics endpoint", .{v});
+                break :blk null;
+            };
+        }
+
         if (std.posix.getenv("CLEANUP_ON_SHUTDOWN")) |v| {
             if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "yes")) {
                 config.cleanup_on_shutdown = true;
@@ -259,6 +267,9 @@ pub const Config = struct {
         });
         if (self.health_port) |port| {
             log.info("config: health_port={d}", .{port});
+        }
+        if (self.metrics_port) |port| {
+            log.info("config: metrics_port={d}", .{port});
         }
     }
 };

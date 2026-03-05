@@ -7,6 +7,8 @@ const protocol = @import("protocol.zig");
 const decoder = @import("decoder.zig");
 const Storage = @import("storage.zig").Storage;
 const health = @import("health.zig");
+const Metrics = @import("metrics.zig").Metrics;
+const MetricsServer = @import("metrics.zig").MetricsServer;
 
 // Allow all messages at comptime; runtime filtering is in our custom logFn.
 pub const std_options: std.Options = .{
@@ -91,6 +93,9 @@ pub fn main() !void {
 
     config.dump();
 
+    // Initialize metrics
+    var m = Metrics{ .start_time_secs = std.time.timestamp() };
+
     // Start health check server if configured
     var health_server: ?health.HealthServer = null;
     if (config.health_port) |port| {
@@ -108,15 +113,34 @@ pub fn main() !void {
         }
     }
 
+    // Start metrics server if configured
+    var metrics_server: ?MetricsServer = null;
+    if (config.metrics_port) |port| {
+        if (MetricsServer.start(port, &m, allocator)) |ms| {
+            metrics_server = ms;
+            log.info("metrics server listening on port {d}", .{port});
+        } else |err| {
+            log.warn("failed to start metrics server on port {d}: {}", .{ port, err });
+        }
+    }
+    defer {
+        if (metrics_server) |*ms| {
+            ms.stop();
+            log.info("metrics server stopped", .{});
+        }
+    }
+
     // Main loop with reconnection
     var attempt: u32 = 0;
     const max_backoff_secs: u64 = 60;
 
     while (!shutdown_requested.load(.acquire)) {
-        runReplicationLoop(allocator, config) catch |err| {
+        runReplicationLoop(allocator, config, &m) catch |err| {
             if (shutdown_requested.load(.acquire)) break;
 
             attempt += 1;
+            Metrics.inc(&m.replication_reconnections_total);
+            Metrics.set(&m.replication_connected, 0);
             const backoff = @min(
                 max_backoff_secs,
                 @as(u64, 1) << @min(attempt, 6), // 1, 2, 4, 8, 16, 32, 60
@@ -140,7 +164,7 @@ pub fn main() !void {
     log.info("zemi shutdown complete", .{});
 }
 
-fn runReplicationLoop(allocator: std.mem.Allocator, config: Config) !void {
+fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics) !void {
     // Step 1: Ensure the publication exists (normal connection)
     log.info("ensuring publication exists...", .{});
     replication.ensurePublication(allocator, config) catch |err| {
@@ -150,18 +174,20 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config) !void {
 
     // Step 2: Open storage connection for persisting changes
     log.info("opening storage connection...", .{});
-    var storage = Storage.init(allocator, config) catch |err| {
+    var storage = Storage.init(allocator, config, m) catch |err| {
         log.err("failed to open storage connection: {}", .{err});
         return err;
     };
     defer {
         storage.deinit();
+        Metrics.set(&m.storage_connected, 0);
         log.info("storage connection closed", .{});
     }
+    Metrics.set(&m.storage_connected, 1);
 
     // Step 3: Open replication connection
     log.info("opening replication connection...", .{});
-    var stream = ReplicationStream.init(allocator, config) catch |err| {
+    var stream = ReplicationStream.init(allocator, config, m) catch |err| {
         log.err("failed to open replication stream: {}", .{err});
         return err;
     };
@@ -169,8 +195,10 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config) !void {
         // Send final status update before closing
         stream.sendStatusUpdate() catch {};
         stream.deinit();
+        Metrics.set(&m.replication_connected, 0);
         log.info("replication connection closed", .{});
     }
+    Metrics.set(&m.replication_connected, 1);
 
     // Step 4: Identify system
     const sys_info = try stream.identifySystem();
@@ -205,6 +233,7 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config) !void {
             // Decode the pgoutput message; returns changes on Commit
             const tx_changes = dec.decode(data.data, data.wal_start) catch |err| {
                 log.warn("decode error: {}, skipping message", .{err});
+                Metrics.inc(&m.decode_errors_total);
                 continue;
             };
 
@@ -222,9 +251,13 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config) !void {
                 var filtered = std.ArrayList(decoder.Change).init(allocator);
                 defer filtered.deinit();
                 for (changes) |change| {
-                    if (std.mem.eql(u8, change.table, "changes")) continue;
+                    if (std.mem.eql(u8, change.table, "changes")) {
+                        Metrics.inc(&m.changes_filtered_total);
+                        continue;
+                    }
                     if (!config.shouldTrackTable(change.table)) {
                         log.debug("skipping untracked table: {s}", .{change.table});
+                        Metrics.inc(&m.changes_filtered_total);
                         continue;
                     }
                     filtered.append(change) catch {};
@@ -239,12 +272,24 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config) !void {
                 // Persist the transaction's changes to the changes table
                 const inserted = storage.persistChanges(filtered.items) catch |err| {
                     log.err("failed to persist {d} changes: {}", .{ filtered.items.len, err });
+                    Metrics.inc(&m.persist_errors_total);
                     // Don't confirm LSN — changes will be replayed on reconnect
                     continue;
                 };
 
                 tx_count += 1;
                 changes_count += filtered.items.len;
+                Metrics.inc(&m.transactions_processed_total);
+
+                // Increment per-operation counters
+                for (filtered.items) |change| {
+                    switch (change.operation) {
+                        .CREATE => Metrics.inc(&m.changes_created_total),
+                        .UPDATE => Metrics.inc(&m.changes_updated_total),
+                        .DELETE => Metrics.inc(&m.changes_deleted_total),
+                        .TRUNCATE => Metrics.inc(&m.changes_truncated_total),
+                    }
+                }
 
                 if (inserted > 0) {
                     for (filtered.items) |change| {
@@ -261,6 +306,7 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config) !void {
                     log.debug("persisted {d}/{d} changes", .{ inserted, filtered.items.len });
                 } else {
                     log.debug("skipped {d} duplicate changes", .{filtered.items.len});
+                    Metrics.add(&m.changes_duplicated_total, filtered.items.len);
                 }
 
                 // Only confirm LSN after successful persistence
@@ -299,4 +345,5 @@ test {
     _ = @import("storage.zig");
     _ = @import("health.zig");
     _ = @import("scram.zig");
+    _ = @import("metrics.zig");
 }

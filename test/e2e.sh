@@ -50,12 +50,15 @@ cleanup() {
     # Drop replication slot and publication (best effort)
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "SELECT pg_drop_replication_slot('$SLOT_NAME');" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "SELECT pg_drop_replication_slot('zemi_filter_test');" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SELECT pg_drop_replication_slot('zemi_metrics_test');" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $PUBLICATION_NAME;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS zemi_filter_pub;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS zemi_metrics_pub;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS test_users CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS test_orders CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_tracked CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_ignored CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS metrics_test CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
     # Clean up SSL test temp files
     rm -rf /tmp/zemi-ssl-certs 2>/dev/null || true
@@ -873,6 +876,76 @@ else
 fi
 
 filter_cleanup
+
+# ---------------------------------------------------------------------------
+# Test 15: Prometheus metrics endpoint (METRICS_PORT)
+# ---------------------------------------------------------------------------
+echo ""
+echo "$(bold "[Test 15] Prometheus metrics endpoint (METRICS_PORT)")"
+
+METRICS_SLOT="zemi_metrics_test"
+METRICS_PUB="zemi_metrics_pub"
+METRICS_PORT_NUM=9191
+METRICS_ZEMI_PID=""
+
+metrics_cleanup() {
+    if [ -n "$METRICS_ZEMI_PID" ] && kill -0 "$METRICS_ZEMI_PID" 2>/dev/null; then
+        kill "$METRICS_ZEMI_PID" 2>/dev/null || true
+        wait "$METRICS_ZEMI_PID" 2>/dev/null || true
+    fi
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SELECT pg_drop_replication_slot('$METRICS_SLOT');" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $METRICS_PUB;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS metrics_test CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
+}
+
+# Clean up any previous state
+metrics_cleanup
+
+# Create test table
+query "CREATE TABLE metrics_test (id SERIAL PRIMARY KEY, name TEXT NOT NULL);"
+
+# Start Zemi with METRICS_PORT
+SLOT_NAME="$METRICS_SLOT" \
+PUBLICATION_NAME="$METRICS_PUB" \
+METRICS_PORT="$METRICS_PORT_NUM" \
+"$ZEMI_BIN" > /tmp/zemi-e2e-metrics.log 2>&1 &
+METRICS_ZEMI_PID=$!
+
+sleep 3
+
+if kill -0 "$METRICS_ZEMI_PID" 2>/dev/null; then
+    # Insert a row to generate a tracked change
+    query "INSERT INTO metrics_test (name) VALUES ('metrics-item');"
+
+    # Wait for the change to be processed
+    METRICS_ELAPSED=0
+    while [ "$METRICS_ELAPSED" -lt 15 ]; do
+        METRICS_COUNT=$(query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'metrics_test';" 2>/dev/null || echo "0")
+        if [ "$METRICS_COUNT" -ge 1 ]; then break; fi
+        sleep 1
+        METRICS_ELAPSED=$((METRICS_ELAPSED + 1))
+    done
+
+    # Fetch metrics endpoint
+    METRICS_OUTPUT=$(curl -s "http://127.0.0.1:${METRICS_PORT_NUM}/metrics" 2>/dev/null || echo "")
+
+    assert_contains "metrics: endpoint returns zemi_changes_processed_total" "zemi_changes_processed_total" "$METRICS_OUTPUT"
+    assert_contains "metrics: endpoint returns zemi_uptime_seconds" "zemi_uptime_seconds" "$METRICS_OUTPUT"
+    assert_contains "metrics: endpoint returns TYPE annotations" "# TYPE zemi_changes_processed_total counter" "$METRICS_OUTPUT"
+
+    # Verify non-metrics path returns 'ok'
+    HEALTH_OUTPUT=$(curl -s "http://127.0.0.1:${METRICS_PORT_NUM}/" 2>/dev/null || echo "")
+    assert_eq "metrics: non-metrics path returns ok" "ok" "$HEALTH_OUTPUT"
+else
+    echo "  $(red "FAIL") Zemi failed to start for metrics endpoint test"
+    echo "  --- Metrics Zemi logs:"
+    cat /tmp/zemi-e2e-metrics.log
+    FAIL=$((FAIL + 4))
+    TOTAL=$((TOTAL + 4))
+fi
+
+metrics_cleanup
 
 # ===========================================================================
 # RESULTS

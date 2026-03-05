@@ -4,6 +4,7 @@ const config_mod = @import("config.zig");
 const Config = config_mod.Config;
 const decoder = @import("decoder.zig");
 const protocol = @import("protocol.zig");
+const Metrics = @import("metrics.zig").Metrics;
 
 const log = std.log.scoped(.storage);
 
@@ -18,11 +19,12 @@ pub const Storage = struct {
     conn: Connection,
     allocator: std.mem.Allocator,
     config: Config,
+    metrics: ?*Metrics = null,
 
     pub const StorageError = Connection.ConnectError;
 
     /// Open a connection to the destination database and run migrations.
-    pub fn init(allocator: std.mem.Allocator, config: Config) StorageError!Storage {
+    pub fn init(allocator: std.mem.Allocator, config: Config, metrics: ?*Metrics) StorageError!Storage {
         var storage = Storage{
             .conn = try Connection.connect(
                 allocator,
@@ -37,6 +39,7 @@ pub const Storage = struct {
             ),
             .allocator = allocator,
             .config = config,
+            .metrics = metrics,
         };
 
         storage.runMigrations() catch |err| {
@@ -57,6 +60,7 @@ pub const Storage = struct {
     /// Used by persistChanges() after a transient connection failure.
     fn reconnect(self: *Storage) StorageError!void {
         log.info("reconnecting to destination database...", .{});
+        if (self.metrics) |m| Metrics.set(&m.storage_connected, 0);
         self.conn.close();
 
         self.conn = try Connection.connect(
@@ -77,6 +81,10 @@ pub const Storage = struct {
             return err;
         };
 
+        if (self.metrics) |m| {
+            Metrics.inc(&m.storage_reconnections_total);
+            Metrics.set(&m.storage_connected, 1);
+        }
         log.info("reconnected to destination database", .{});
     }
 
@@ -495,6 +503,7 @@ test "buildInsertSql produces valid SQL for single change" {
         .conn = undefined,
         .allocator = allocator,
         .config = Config{},
+        .metrics = null,
     };
 
     const sql = try storage.buildInsertSql(&changes);
@@ -537,6 +546,7 @@ test "buildInsertSql uses change.context when present" {
         .conn = undefined,
         .allocator = allocator,
         .config = Config{},
+        .metrics = null,
     };
 
     const sql = try storage.buildInsertSql(&changes);
@@ -582,6 +592,7 @@ test "buildInsertSql uses empty context when null" {
         .conn = undefined,
         .allocator = allocator,
         .config = Config{},
+        .metrics = null,
     };
 
     const sql = try storage.buildInsertSql(&changes);

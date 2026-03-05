@@ -35,28 +35,28 @@ PostgreSQL WAL ──> zemi (single binary) ──> PostgreSQL (changes table)
 Internally, Zemi is a pipeline:
 
 ```
-┌─────────────┐    ┌──────────────┐    ┌─────────┐    ┌──────────┐    ┌─────────┐
-│ connection   │───>│ replication   │───>│ decoder  │───>│ storage   │───>│ health   │
-│ + protocol   │    │ (WAL stream)  │    │ (pgoutput│    │ (changes  │    │ (HTTP    │
-│ + scram      │    │               │    │  parser) │    │  table)   │    │  server) │
-│ + tls        │    │               │    │          │    │           │    │          │
-└─────────────┘    └──────────────┘    └─────────┘    └──────────┘    └─────────┘
-        │                                                                    │
-        └──────────────── config ────────────────────────────────────────────┘
+┌─────────────┐    ┌──────────────┐    ┌─────────┐    ┌──────────┐    ┌─────────┐    ┌─────────┐
+│ connection   │───>│ replication   │───>│ decoder  │───>│ storage   │───>│ health   │    │ metrics  │
+│ + protocol   │    │ (WAL stream)  │    │ (pgoutput│    │ (changes  │    │ (HTTP    │    │ (Prom.   │
+│ + scram      │    │               │    │  parser) │    │  table)   │    │  server) │    │  server) │
+│ + tls        │    │               │    │          │    │           │    │          │    │          │
+└─────────────┘    └──────────────┘    └─────────┘    └──────────┘    └─────────┘    └─────────┘
+        │                                                                    │               │
+        └──────────────── config ────────────────────────────────────────────┴───────────────┘
 ```
 
 ## Source Files
 
-All Zig source lives in `src/`. The codebase is ~5,000 lines with 50+ unit tests.
+All Zig source lives in `src/`. The codebase is ~5,500 lines with 58 unit tests.
 
 ### Dependency Layers
 
 ```
-Layer 0 (no src/ deps):  protocol.zig, scram.zig, config.zig, health.zig
+Layer 0 (no src/ deps):  protocol.zig, scram.zig, config.zig, health.zig, metrics.zig
 Layer 1:                 connection.zig  (protocol + scram + config + tls)
 Layer 2:                 decoder.zig     (protocol)
-                         replication.zig (protocol + connection + config)
-                         storage.zig     (connection + config + decoder + protocol)
+                         replication.zig (protocol + connection + config + metrics)
+                         storage.zig     (connection + config + decoder + protocol + metrics)
 Layer 3:                 main.zig        (everything)
 ```
 
@@ -92,14 +92,14 @@ SCRAM-SHA-256 authentication (RFC 5802) for PostgreSQL 14+.
 - `buildSaslInitialResponse()` / `buildSaslResponse()` — PostgreSQL SASL message builders
 - Key detail: `"biws"` is base64 of `"n,,"` (GS2 channel binding header). The `initWithNonce()` constructor allows deterministic test vectors.
 
-**`src/replication.zig`** (~278 lines, 0 tests)
+**`src/replication.zig`** (~292 lines, 0 tests)
 Replication slot and WAL stream management.
-- `ReplicationStream` — wraps a `Connection` opened with `replication="database"`
+- `ReplicationStream` — wraps a `Connection` opened with `replication="database"`, holds optional `?*Metrics` for instrumentation
 - `identifySystem()` — `IDENTIFY_SYSTEM` command
 - `createSlotIfNotExists()` — `CREATE_REPLICATION_SLOT ... LOGICAL pgoutput NOEXPORT_SNAPSHOT` (idempotent; catches "slot already exists" errors)
 - `startReplication()` — `START_REPLICATION SLOT ... LOGICAL ...` with `proto_version '1'`, `publication_names`, and `messages 'true'`
-- `poll()` — reads one CopyData, returns XLogData or handles keepalive (auto-responds when `reply_requested`)
-- `confirmLsn()` — advances the flushed LSN (monotonically increasing only)
+- `poll()` — reads one CopyData, returns XLogData or handles keepalive (auto-responds when `reply_requested`); increments `wal_messages_received_total` / `keepalives_received_total` metrics and updates `last_received_lsn` gauge
+- `confirmLsn()` — advances the flushed LSN (monotonically increasing only); updates `last_flushed_lsn` gauge
 - `ensurePublication()` — creates publication via a separate non-replication connection
 - `dropPublication()` — drops the publication via a normal connection (best-effort, used during cleanup on shutdown)
 - `dropSlot()` — drops the replication slot via a normal connection using `pg_drop_replication_slot()` (best-effort, used during cleanup on shutdown)
@@ -115,22 +115,22 @@ pgoutput logical decoding message parser and transaction state machine.
 - **Context stitching**: Logical decoding messages with prefix `_bemi` (transactional only) are captured as `transaction_context` and stamped onto all changes in the same transaction at commit time. This `_bemi` prefix is part of the wire protocol used by ORM packages — do NOT rename it.
 - Key detail: The decoder uses two-layer ownership. The parser returns slices into the read buffer (zero-copy). `decode()` then dupes all strings it needs for `Change` records that outlive the buffer.
 
-**`src/storage.zig`** (~595 lines, 10 tests)
+**`src/storage.zig`** (~605 lines, 10 tests)
 Change persistence to PostgreSQL with schema migration, retry logic, and automatic reconnection.
-- `Storage` — wraps a `Connection` and `Config` for the destination database; resilient to connection drops
-- `init()` — connects and runs idempotent migrations (CREATE TABLE IF NOT EXISTS, indexes, unique constraint)
-- `reconnect()` — closes the dead connection, opens a fresh one, and re-runs migrations (idempotent). Called automatically by `persistChanges()` on transient failures.
+- `Storage` — wraps a `Connection`, `Config`, and optional `?*Metrics` for the destination database; resilient to connection drops
+- `init()` — connects and runs idempotent migrations (CREATE TABLE IF NOT EXISTS, indexes, unique constraint); accepts optional `?*Metrics`
+- `reconnect()` — closes the dead connection, opens a fresh one, and re-runs migrations (idempotent). Called automatically by `persistChanges()` on transient failures. Increments `storage_reconnections_total` and updates `storage_connected` gauge via metrics.
 - `persistChanges()` — multi-row INSERT with `ON CONFLICT DO NOTHING` for deduplication; retries transient errors up to 3 times with exponential backoff (100ms base). On each retry, reconnects to the destination database before re-executing the query.
 - JSON serialization: `appendJsonObject()` / `appendJsonString()` build JSONB literals with proper escaping
 - The `changes` table schema has 14 columns including UUID PK, JSONB before/after/context, GIN indexes, and a unique constraint on (position, table, schema, database, operation) for deduplication.
 - Key detail: The `changes` table itself must be filtered from tracking (in `main.zig`) to prevent infinite recursive WAL events.
 - Key detail: Storage stores the full `Config` so it can reconnect without external help. The reconnection is transparent to callers — `persistChanges()` handles it internally.
 
-**`src/config.zig`** (~345 lines, 7 tests)
+**`src/config.zig`** (~356 lines, 7 tests)
 Environment variable configuration.
 - `SslMode` enum — `disable`, `require`, `verify_ca`, `verify_full` with `fromString()`/`toString()` conversion
 - `Config` struct — all settings with defaults. Slot and publication names default to `"zemi"`.
-- `fromEnv()` — reads 21 environment variables (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DB_SSL_MODE, DB_SSL_ROOT_CERT, SLOT_NAME, PUBLICATION_NAME, DEST_DB_*, LOG_LEVEL, TABLES, SHUTDOWN_TIMEOUT, HEALTH_PORT, CLEANUP_ON_SHUTDOWN)
+- `fromEnv()` — reads 22 environment variables (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DB_SSL_MODE, DB_SSL_ROOT_CERT, SLOT_NAME, PUBLICATION_NAME, DEST_DB_*, LOG_LEVEL, TABLES, SHUTDOWN_TIMEOUT, HEALTH_PORT, METRICS_PORT, CLEANUP_ON_SHUTDOWN)
 - `getDestSslMode()` / `getDestSslRootCert()` — destination SSL settings with fallback to source DB settings
 - `shouldTrackTable()` — comma-separated table filter with whitespace trimming
 - `validate()` — returns first validation error message or null
@@ -144,10 +144,22 @@ HTTP health check server for container orchestration (Docker HEALTHCHECK, Kubern
 - Uses `std.c.accept()` instead of `std.posix.accept()` to avoid unreachable panic on ENOTSOCK during shutdown
 - Graceful stop via atomic flag + self-connect trick to unblock the blocking `accept()`
 
-**`src/main.zig`** (~300 lines, 1 test block importing all modules)
+**`src/metrics.zig`** (~355 lines, 5 tests)
+Prometheus metrics collection and HTTP exposition endpoint.
+- `Metrics` struct — 14 atomic counters (changes by operation, filtered, duplicated, transactions, WAL messages, keepalives, decode/persist errors, storage/replication reconnections) + 5 atomic gauges (last received/flushed LSN, replication/storage connected, start time) + 1 derived gauge (replication lag bytes)
+- `Metrics.inc()` / `Metrics.add()` / `Metrics.set()` — thread-safe helpers using `std.atomic.Value(u64)` with `.monotonic` ordering
+- `Metrics.render()` — produces Prometheus text exposition format (v0.0.4) with HELP, TYPE, and metric lines; caller owns returned slice
+- `MetricsServer` — TCP accept loop in background thread, serves `/metrics` with rendered Prometheus text and any other path with HTTP 200 "ok"
+- `isMetricsRequest()` — parses HTTP request line to detect `/metrics` path
+- Uses `std.c.accept()` and self-connect shutdown trick (same pattern as `HealthServer`)
+- Key detail: `MetricsServer` holds `*const Metrics` — the `Metrics` struct lives in `main()` stack frame for the process lifetime. All metric names are prefixed with `zemi_`.
+
+**`src/main.zig`** (~349 lines, 1 test block importing all modules)
 Application entry point and orchestration.
-- Sets up `GeneralPurposeAllocator`, installs POSIX signal handlers (SIGINT/SIGTERM), reads config, optionally starts health server
+- Sets up `GeneralPurposeAllocator`, installs POSIX signal handlers (SIGINT/SIGTERM), reads config, optionally starts health server, optionally starts metrics server
+- Creates `Metrics` struct on the stack, passes `*Metrics` to `Storage` and `ReplicationStream` for instrumentation
 - `runReplicationLoop()` — ensures publication, opens storage, opens replication stream, starts streaming, decodes pgoutput, filters changes (skips `changes` table + untracked tables), persists to storage, confirms LSN, sends periodic status updates (60s)
+- Metrics wiring: increments per-operation counters, decode/persist errors, filtered/duplicated changes, transaction counts, replication reconnections; sets connection state gauges
 - Runtime log level filtering: `std_options.log_level` is `.debug` at comptime; actual filtering happens in `runtimeLogFn` based on config
 - Graceful shutdown: first SIGTERM sets atomic flag checked in main loop; second signal forces `process.exit(1)`
 - Exponential backoff reconnection: 1, 2, 4, 8, 16, 32, 60 seconds (capped)
@@ -163,7 +175,7 @@ Application entry point and orchestration.
 
 ## Testing
 
-### Unit Tests (53 tests)
+### Unit Tests (58 tests)
 
 Run with `zig build test`. All tests are pulled in via `src/main.zig`'s test block which `@import`s all modules. Tests are in-file (Zig convention).
 
@@ -174,18 +186,19 @@ Run with `zig build test`. All tests are pulled in via `src/main.zig`'s test blo
 | storage.zig | 10 | SQL building, escaping, JSON serialization, timestamp conversion, error classification |
 | scram.zig | 5 | Full SCRAM exchange, nonce mismatch, signature verification, SASL message formats |
 | config.zig | 7 | Table filtering, whitespace trimming, validation, SSL mode parsing, dest SSL fallback |
+| metrics.zig | 5 | Counter inc/set, Prometheus text format rendering, /metrics path detection, HTTP response format |
 | health.zig | 1 | HTTP response format |
 
 **Important**: Zig's test runner treats `log.err` calls as test failures. Error-path tests must use `log.warn` instead.
 
-### E2E Integration Tests (40 assertions, 14 test groups)
+### E2E Integration Tests (46 assertions, 15 test groups)
 
 Run with `./test/e2e.sh` (uses Docker Compose) or `./test/e2e.sh --no-docker` (expects PostgreSQL already running on ports 5433, 5434, and 5435).
 
 The test script:
 1. Starts three PostgreSQL 16 instances: MD5 (port 5433), SCRAM-SHA-256 (port 5434), and SSL-enabled (port 5435)
 2. Builds Zemi from source
-3. Runs 14 test groups covering: connection, INSERT/UPDATE/DELETE/TRUNCATE tracking, data correctness, table filtering, context stitching, storage reconnection on DB restart, graceful shutdown cleanup, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca + verify-full), table filtering via TABLES env var
+3. Runs 15 test groups covering: connection, INSERT/UPDATE/DELETE/TRUNCATE tracking, data correctness, table filtering, context stitching, storage reconnection on DB restart, graceful shutdown cleanup, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca + verify-full), table filtering via TABLES env var, Prometheus metrics endpoint
 4. Each test starts Zemi as a background process, performs SQL operations, waits, then queries the `changes` table
 
 **`docker-compose.test.yml`** — three PostgreSQL 16 Alpine services:
@@ -276,7 +289,8 @@ This is transparent to callers — the main replication loop continues without c
 │   ├── decoder.zig               # pgoutput parser + context stitching
 │   ├── storage.zig               # Change persistence + migrations
 │   ├── config.zig                # Environment variable config
-│   └── health.zig                # HTTP health check server
+│   ├── health.zig                # HTTP health check server
+│   └── metrics.zig               # Prometheus metrics + HTTP server
 ├── test/
 │   ├── e2e.sh                  # E2E integration test script
 │   └── Dockerfile.postgres-ssl # SSL-enabled PostgreSQL for testing
@@ -324,14 +338,12 @@ The `core/` and `worker/` directories contain the original TypeScript/Node.js co
 - SSL/TLS support (`src/connection.zig` — SSLRequest negotiation, TLS handshake, TLS-aware I/O wrappers)
 - SSL configuration (`src/config.zig` — `SslMode` enum, `DB_SSL_MODE`, `DB_SSL_ROOT_CERT`, dest fallbacks)
 - Graceful shutdown with slot/publication cleanup (`CLEANUP_ON_SHUTDOWN` env var, `replication.dropSlot()` + `replication.dropPublication()` via normal connections)
-- E2E integration tests (40 assertions across 14 test groups including reconnection, SCRAM, SSL verify-full, table filtering, and graceful shutdown cleanup)
+- E2E integration tests (46 assertions across 15 test groups including reconnection, SCRAM, SSL verify-full, table filtering, graceful shutdown cleanup, and Prometheus metrics)
 - Full CI pipeline with cross-compilation, E2E (MD5 + SCRAM + SSL), Docker, and release automation
 - Docusaurus documentation (5 Zemi pages + updated site config)
 - Rename from Bemi to Zemi throughout
 - Resilient storage connection with automatic reconnection on transient failures
-
-### Potential Future Work
-- **Observability/metrics** — Prometheus endpoint for monitoring
+- Prometheus metrics endpoint (`src/metrics.zig` — 14 counters + 5 gauges + 1 derived gauge, `MetricsServer` with HTTP `/metrics` endpoint, wired into storage, replication, and main loop; `METRICS_PORT` env var)
 
 ## How to Work on This Codebase
 
@@ -364,5 +376,6 @@ zig fmt src/ build.zig
 ### Debugging Tips
 - Set `LOG_LEVEL=debug` for verbose output (shows all WAL messages, SQL queries, etc.)
 - The health server on `HEALTH_PORT` confirms the process is running and accepting connections
+- The metrics server on `METRICS_PORT` exposes Prometheus counters and gauges at `/metrics`
 - Use `pg_stat_replication` and `pg_replication_slots` PostgreSQL views to check slot status
 - LSN values are logged in `X/Y` format (upper 32 bits / lower 32 bits)

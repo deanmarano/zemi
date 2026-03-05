@@ -2,6 +2,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const Connection = @import("connection.zig").Connection;
 const Config = @import("config.zig").Config;
+const Metrics = @import("metrics.zig").Metrics;
 
 const log = std.log.scoped(.replication);
 
@@ -11,6 +12,7 @@ pub const ReplicationStream = struct {
     conn: Connection,
     allocator: std.mem.Allocator,
     config: Config,
+    metrics: ?*Metrics = null,
 
     // Replication state
     last_received_lsn: u64 = 0,
@@ -19,7 +21,7 @@ pub const ReplicationStream = struct {
     /// Callback type for processing XLogData messages.
     pub const XLogCallback = *const fn (data: protocol.XLogData, ctx: ?*anyopaque) void;
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) !ReplicationStream {
+    pub fn init(allocator: std.mem.Allocator, config: Config, metrics: ?*Metrics) !ReplicationStream {
         // Open a replication connection
         const conn = Connection.connect(
             allocator,
@@ -40,6 +42,7 @@ pub const ReplicationStream = struct {
             .conn = conn,
             .allocator = allocator,
             .config = config,
+            .metrics = metrics,
         };
     }
 
@@ -137,11 +140,19 @@ pub const ReplicationStream = struct {
                 if (xlog.wal_end > self.last_received_lsn) {
                     self.last_received_lsn = xlog.wal_end;
                 }
+                if (self.metrics) |m| {
+                    Metrics.inc(&m.wal_messages_received_total);
+                    Metrics.set(&m.last_received_lsn, self.last_received_lsn);
+                }
                 return xlog;
             },
             .keepalive => |ka| {
                 if (ka.wal_end > self.last_received_lsn) {
                     self.last_received_lsn = ka.wal_end;
+                }
+                if (self.metrics) |m| {
+                    Metrics.inc(&m.keepalives_received_total);
+                    Metrics.set(&m.last_received_lsn, self.last_received_lsn);
                 }
                 if (ka.reply_requested) {
                     try self.sendStatusUpdate();
@@ -174,6 +185,9 @@ pub const ReplicationStream = struct {
     pub fn confirmLsn(self: *ReplicationStream, lsn: u64) void {
         if (lsn > self.last_flushed_lsn) {
             self.last_flushed_lsn = lsn;
+            if (self.metrics) |m| {
+                Metrics.set(&m.last_flushed_lsn, lsn);
+            }
         }
     }
 };

@@ -77,6 +77,13 @@ const sidebars: SidebarsConfig = {
     'self-hosting',
     'changelog',
   ],
+  zemiSidebar: [
+    'zemi/overview',
+    'zemi/benchmarks',
+    'zemi/architecture',
+    'zemi/configuration',
+    'zemi/migration',
+  ],
 };
 
 export default sidebars;

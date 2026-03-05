@@ -1,0 +1,9 @@
+zig-out/
+zig-cache/
+.zig-cache/
+.git/
+docs/
+*.md
+LICENSE
+.tool-versions
+.github/

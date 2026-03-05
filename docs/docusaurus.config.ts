@@ -66,6 +66,18 @@ const config: Config = {
       },
       items: [
         {
+          type: "docSidebar",
+          sidebarId: "bemiSidebar",
+          label: "Bemi",
+          position: "left",
+        },
+        {
+          type: "docSidebar",
+          sidebarId: "zemiSidebar",
+          label: "Zemi",
+          position: "left",
+        },
+        {
           href: "https://github.com/BemiHQ/bemi-io",
           label: "GitHub",
           position: "right",
@@ -139,6 +151,31 @@ const config: Config = {
           ],
         },
         {
+          title: "Zemi",
+          items: [
+            {
+              label: "Overview",
+              to: "/zemi",
+            },
+            {
+              label: "Benchmarks",
+              to: "/zemi/benchmarks",
+            },
+            {
+              label: "Architecture",
+              to: "/zemi/architecture",
+            },
+            {
+              label: "Configuration",
+              to: "/zemi/configuration",
+            },
+            {
+              label: "Migration Guide",
+              to: "/zemi/migration",
+            },
+          ],
+        },
+        {
           title: "Socials",
           items: [
             {
@@ -157,7 +194,7 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['ruby'],
+      additionalLanguages: ['ruby', 'zig'],
     },
   } satisfies Preset.ThemeConfig,
 };

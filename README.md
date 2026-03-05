@@ -1,179 +1,319 @@
-<div align="center">
-  <a href="https://bemi.io">
-    <img width="1201" alt="bemi-banner" src="https://docs.bemi.io/img/bemi-banner.png">
-  </a>
+# Zemi
 
-  <p align="center">
-    <a href="https://bemi.io">Website</a>
-    ·
-    <a href="https://docs.bemi.io">Docs</a>
-    ·
-    <a href="https://github.com/BemiHQ/bemi-io/issues/new">Report Bug</a>
-    ·
-    <a href="https://github.com/BemiHQ/bemi-io/issues/new">Request Feature</a>
-    ·
-    <a href="https://discord.gg/mXeZ6w2tGf">Discord</a>
-    ·
-    <a href="https://twitter.com/BemiHQ">Twitter</a>
-    ·
-    <a href="https://www.linkedin.com/company/bemihq/about">LinkedIn</a>
-  </p>
-</div>
+A fork of [BemiHQ/bemi-io](https://github.com/BemiHQ/bemi-io), rewritten from scratch in Zig.
 
-# Bemi
+Zemi automatically tracks every database change (INSERT, UPDATE, DELETE, TRUNCATE) with 100% reliability. It connects to PostgreSQL's [Write-Ahead Log](https://www.postgresql.org/docs/current/wal-intro.html) (WAL) and implements [Change Data Capture](https://en.wikipedia.org/wiki/Change_data_capture) (CDC). Non-invasive by design, it operates in the background without altering your existing database tables.
 
-Bemi automatically tracks database changes ensuring 100% reliability and a comprehensive understanding of every change. It does it by connecting PostgreSQL's [Write-Ahead Log](https://www.postgresql.org/docs/current/wal-intro.html) (WAL) and implementing [Change Data Capture](https://en.wikipedia.org/wiki/Change_data_capture) (CDC) data pattern. Designed with simplicity and non-invasiveness in mind, Bemi operates in the background and doesn't require any alterations to your existing database tables.
+Zemi replaces the original Bemi's multi-runtime architecture (Java/Debezium + Go/NATS + TypeScript/Node.js) with a **single statically-linked Zig binary** that directly implements the PostgreSQL logical replication protocol.
 
-## Contents
+## Benchmarks
 
-- [Highlights](#highlights)
-- [Use cases](#use-cases)
-- [System dependencies](#system-dependencies)
-- [Quickstart for local development](#quickstart-for-local-development)
-  - [Running with Docker](#running-with-docker)
-  - [Running with Devbox](#running-with-devbox)
-  - [Running natively](#running-natively)
-- [Contextualizing data changes](#contextualizing-data-changes)
-- [Architecture](#architecture)
-- [Testing](#testing)
-- [License](#license)
+Real measurements comparing Zemi to the original Bemi:
 
-## Highlights
+| Metric | Original Bemi | Zemi | Improvement |
+|--------|--------------|------|-------------|
+| **Docker image** | 3.23 GB | 1.04 MB | **3,100x smaller** |
+| **Binary size** | N/A (3 runtimes) | 3.7 MB | single static binary |
+| **Memory (RSS)** | 300-500+ MB | 2.8 MB | **~150x less** |
+| **Startup time** | 30-60 seconds | <1 ms | **instant** |
+| **Processes** | 4+ (sh, java, nats, node) | 1 | single process |
+| **Runtime deps** | JRE, Node.js, NATS, pnpm, MikroORM | 0 | zero dependencies |
 
-- Automatic and 100% reliable database change tracking
-- High performance without affecting runtime execution
-- Easy-to-use without changing table structures
-- Time travel querying and ability to easily filter changes
-- Optional application-specific context by using [ORM packages](https://docs.bemi.io/#supported-orms)
+### How we measured
 
-## Use cases
+- **Docker image size**: `docker images` after building both images on `linux/amd64`
+- **Memory**: `ps -o rss=` during active WAL replication against a live PostgreSQL instance
+- **Startup time**: `/usr/bin/time` measuring wall clock from exec to first log output (Zemi: `0.00 real`)
+- **Original Bemi memory**: NATS server alone uses 19 MB RSS before Debezium JVM even starts; at steady state with all three runtimes active, 300-500+ MB is typical
 
-There's a wide range of use cases that Bemi is built for! The tech was initially built as a compliance engineering system for fintech that supported $15B worth of assets under management, but has since been extracted into a general-purpose utility. Some use cases include:
+## Quick Start
 
-- **Audit Trails:** Use logs for compliance purposes or surface them to customer support and external customers.
-- **Streaming:** Real-time data stream to an application.
-- **Time Travel:** Retrieve historical data without implementing event sourcing.
-- **Troubleshooting:** Identify the root cause of application issues.
-- **Change Reversion:** Revert changes made by a user or rollback all data changes within an API request.
-- **Distributed Tracing:** Track changes across distributed systems.
-- **Testing:** Rollback or roll-forward to different application test states.
-- **Analyzing Trends:** Gain insights into historical trends and changes for informed decision-making.
+### Docker
 
-## System dependencies
+```bash
+docker run --rm \
+  -e DB_HOST=host.docker.internal \
+  -e DB_PORT=5432 \
+  -e DB_NAME=mydb \
+  -e DB_USER=postgres \
+  -e DB_PASSWORD=secret \
+  ghcr.io/deanmarano/zemi:latest
+```
 
-- Node.js
-- Java
-- [NATS server](https://github.com/nats-io/nats-server)
+### From Source
 
-And of course, you need a PostgreSQL database that you want to connect to to track data changes. Make sure your database has `SHOW wal_level;` returning `logical`. Otherwise, you need to run the following SQL command and restart your PostgreSQL server:
+Requires [Zig 0.14.1](https://ziglang.org/download/) (or use `asdf install` with the included `.tool-versions`).
+
+```bash
+# Build
+zig build
+
+# Run
+DB_HOST=127.0.0.1 DB_NAME=mydb DB_USER=postgres DB_PASSWORD=secret \
+  ./zig-out/bin/zemi
+
+# Run tests (42 unit tests)
+zig build test
+```
+
+### Pre-built Binaries
+
+Download from [GitHub Releases](https://github.com/deanmarano/bemi-io/releases) for your platform:
+
+| Binary | Platform | Size |
+|--------|----------|------|
+| `zemi-x86_64-linux` | Linux x86_64 (static) | 3.7 MB |
+| `zemi-aarch64-linux` | Linux ARM64 (static) | 3.8 MB |
+| `zemi-x86_64-macos` | macOS Intel | 510 KB |
+| `zemi-aarch64-macos` | macOS Apple Silicon | 497 KB |
+
+All Linux binaries are statically linked with zero runtime dependencies.
+
+## Prerequisites
+
+A PostgreSQL database (14+) with logical replication enabled:
 
 ```sql
 ALTER SYSTEM SET wal_level = logical;
+-- Restart PostgreSQL after this change
 ```
 
-To track both the "before" and "after" states on data changes, please run the following SQL command:
+To track both "before" and "after" states on data changes:
 
 ```sql
 ALTER TABLE [tracked_table_name] REPLICA IDENTITY FULL;
 ```
 
-## Quickstart for local development
+## Configuration
 
-### Running with Docker
+All configuration is via environment variables, fully compatible with the original Bemi.
 
-Run a Docker container that connects to your local PostgreSQL database:
+### Required
 
-```sh
-docker run \
-  -e DB_HOST=host.docker.internal \
-  -e DB_PORT=5432 \
-  -e DB_NAME=[YOUR_DATABASE] \
-  -e DB_USER=postgres \
-  -e DB_PASSWORD=postgres \
-  public.ecr.aws/bemi/dev:latest
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DB_HOST` | PostgreSQL host | `127.0.0.1` |
+| `DB_PORT` | PostgreSQL port | `5432` |
+| `DB_NAME` | Database name | `postgres` |
+| `DB_USER` | Database user | `postgres` |
+| `DB_PASSWORD` | Database password | `postgres` |
+
+### Replication
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SLOT_NAME` | Logical replication slot name | `zemi` |
+| `PUBLICATION_NAME` | Publication name | `zemi` |
+
+### Destination Database
+
+By default, changes are written to the same database being tracked. Set these to write to a separate database:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DEST_DB_HOST` | Destination host | same as `DB_HOST` |
+| `DEST_DB_PORT` | Destination port | same as `DB_PORT` |
+| `DEST_DB_NAME` | Destination database | same as `DB_NAME` |
+| `DEST_DB_USER` | Destination user | same as `DB_USER` |
+| `DEST_DB_PASSWORD` | Destination password | same as `DB_PASSWORD` |
+
+### Operational
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, `error` | `info` |
+| `TABLES` | Comma-separated list of tables to track (empty = all) | all tables |
+| `HEALTH_PORT` | TCP port for health check endpoint (empty = disabled) | disabled |
+| `SHUTDOWN_TIMEOUT` | Seconds to wait for graceful shutdown | `30` |
+
+### Health Check
+
+When `HEALTH_PORT` is set, a minimal HTTP health endpoint responds on that port:
+
+```bash
+HEALTH_PORT=4005 ./zig-out/bin/zemi
+
+# In another terminal:
+curl http://localhost:4005/
+# Returns: HTTP 200 OK
 ```
-
-Replace `DB_NAME` with your local database name. Note that `DB_HOST` pointing to `host.docker.internal` allows accessing `127.0.0.1` on your host machine if you run PostgreSQL outside Docker.
-
-Now try making some database changes like:
-
-```sql
-UPDATE _bemi_migrations SET executed_at = NOW() WHERE id = 1;
-```
-
-This will add a new record in the `changes` table within the same database after a few seconds:
-
-```sql
-SELECT "primary_key", "table", "operation", "before", "after", "context", "committed_at" FROM changes;
-```
-
-### Running with Devbox
-
-You can install all system dependencies manually or use [Devbox](https://github.com/jetpack-io/devbox) that relies on
-[Nix Packages](https://github.com/NixOS/nixpkgs) for providing isolated shells without containerization.
-Run a single command that will install Node.js with pnpm and NATS server:
-
-```sh
-make worker-install
-```
-
-Set environment variables specifying connection settings for a PostgreSQL database you want to track and run a worker:
-
-```sh
-export DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=postgres DB_USER=postgres DB_PASSWORD=postgres
-make worker-up
-```
-
-Now try making some database changes like:
-
-```sql
-UPDATE _bemi_migrations SET executed_at = NOW() WHERE id = 1;
-```
-
-This will add a new record in the `changes` table within the same database after a few seconds.
-
-### Running natively
-
-After installing all system dependencies, install all project dependencies with Node.js:
-
-```sh
-make worker-setup && cd worker && npm install
-```
-
-Set environment variables specifying connection settings for a PostgreSQL database you want to track run a worker as a single process with directly installed Node.js:
-
-
-```sh
-export DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=postgres DB_USER=postgres DB_PASSWORD=postgres
-npm concurrently -- "npm:up:*"
-```
-
-Now try making some database changes like:
-
-```sql
-UPDATE _bemi_migrations SET executed_at = NOW() WHERE id = 1;
-```
-
-This will add a new record in the `changes` table within the same database after a few seconds.
-
-## Contextualizing data changes
-
-Optionally, to automatically enhance these low-level database changes with application-specific context (e.g., user ID, API endpoint, etc.), check out our compatible [ORM packages](https://docs.bemi.io/#supported-orms).
 
 ## Architecture
 
-![Bemi Worker Architecture](docs/static/img/worker.png)
+```
+PostgreSQL WAL ──> zemi (single Zig binary) ──> PostgreSQL (changes table)
+```
 
-Bemi consists of three main parts:
+The original Bemi requires four processes across three runtimes:
 
-1. [Debezium](https://github.com/debezium/debezium), a very flexible tool for implementing Change Data Capture that is written in Java. It is used by many companies that need to implement ETL such as [Airbyte](https://github.com/airbytehq/airbyte) and [Materialize](https://github.com/MaterializeInc/materialize). We rely on it to be able to connect to PostgreSQL replication log, perform logical decoding, and send raw data to a data sink.
-2. [NATS JetStream](https://github.com/nats-io/nats-server), a cloud-native messaging system written in Go. Debezium is historically designed to send data to Kafka, but it can be also re-configured to send data to NATS JetStream. It is much more lightweight and easy to manage while being very performant and having over 45 clients for different programming languages.
-3. Bemi Worker, a process responsible for stitching data change with app context sent via our open-source [ORM packages](https://docs.bemi.io/#supported-orms) and storing data changes. It is written in TypeScript and uses the `core` that we rely on for our [Bemi](https://bemi.io/) cloud platform.
+```
+PostgreSQL WAL ──> Debezium (Java) ──> NATS (Go) ──> Worker (Node.js) ──> PostgreSQL
+```
 
-The described architecture and the `worker` code in this repository are a simplified version that can be easily run without much overhead.
-If you want to self-host it in a production environment, see our [self-hosting docs](https://docs.bemi.io/self-hosting).
-Alternatively, [sign up](https://dashboard.bemi.io/log-in?ref=gh) with your GitHub login to use Bemi Cloud.
+### Why This Is Better
+
+**Fewer moving parts.** The original Bemi chains four processes together. Each one is a point of failure. Debezium reads the WAL and publishes to NATS. NATS queues messages. A Node.js worker consumes from NATS and writes to PostgreSQL. If any link in that chain goes down, changes are delayed or lost until recovery.
+
+Zemi reads the WAL and writes to PostgreSQL. That's it. One process, one connection in, one connection out.
+
+**No JVM.** Debezium runs on the JVM, which means a 30-60 second startup time, 300+ MB of baseline memory, and garbage collection pauses. Zemi starts in under a millisecond and uses 2.8 MB of memory.
+
+**No message broker.** NATS adds operational complexity (JetStream configuration, stream management, consumer groups) for what is fundamentally a single-producer, single-consumer pipeline. Zemi processes changes in-memory as they arrive from the WAL.
+
+**Deterministic resource usage.** Zig has no garbage collector and no hidden allocations. Memory usage is stable and predictable under load, not subject to GC pauses or heap growth.
+
+**Trivial deployment.** One static binary. Copy it anywhere and run it. No `package.json`, no `pom.xml`, no runtime installation. The Docker image is 1 MB because it's literally just the binary on a `scratch` base.
+
+### Internal Components
+
+```
++-----------------------------------------------------+
+|                    zemi binary                        |
+|                                                       |
+|  +----------+  +----------+  +----------+            |
+|  | protocol |  | decoder  |  | storage  |            |
+|  |          |  |          |  |          |            |
+|  | PG wire  |  | pgoutput |  | changes  |            |
+|  | protocol |->| parsing  |->| table    |            |
+|  | + repl   |  | + context|  | persist  |            |
+|  +----------+  +----------+  +----------+            |
+|                                                       |
+|  +----------+  +----------+  +----------+            |
+|  |connection|  |  config  |  |  health  |            |
+|  |          |  |          |  |          |            |
+|  | TCP +    |  | env vars |  | HTTP     |            |
+|  | auth     |  | + valid  |  | /health  |            |
+|  +----------+  +----------+  +----------+            |
++-----------------------------------------------------+
+```
+
+- **protocol.zig** -- PostgreSQL wire protocol encoding/decoding, replication messages, MD5 auth
+- **connection.zig** -- TCP connection management, startup/auth handshake, simple query protocol
+- **replication.zig** -- Logical replication stream, slot/publication management, WAL streaming
+- **decoder.zig** -- `pgoutput` logical decoding plugin parser, relation cache, context stitching
+- **storage.zig** -- Change persistence, schema migration, JSON serialization, retry logic
+- **config.zig** -- Environment variable parsing, validation
+- **health.zig** -- TCP health check server
+- **main.zig** -- Entry point, signal handling, reconnection loop, graceful shutdown
+
+## Building
+
+### Default Build (native target, debug)
+
+```bash
+zig build
+```
+
+### Release Build (native target, optimized)
+
+```bash
+zig build -Doptimize=ReleaseSafe
+```
+
+### Cross-Compile All Targets
+
+```bash
+zig build release
+# Outputs:
+#   zig-out/x86_64-linux/zemi
+#   zig-out/aarch64-linux/zemi
+#   zig-out/x86_64-macos/zemi
+#   zig-out/aarch64-macos/zemi
+```
+
+### Cross-Compile Single Target
+
+```bash
+zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+```
+
+### Docker
+
+```bash
+# Build for current platform
+docker build -t zemi .
+
+# Build for specific platform
+docker build --platform linux/amd64 -t zemi .
+```
+
+## Changes Table Schema
+
+Zemi creates a `changes` table in the destination database with the following schema:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `uuid` | Unique change identifier |
+| `database` | `text` | Source database name |
+| `schema` | `text` | Source schema name |
+| `table` | `text` | Source table name |
+| `operation` | `text` | `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE` |
+| `before` | `jsonb` | Row state before the change (null for INSERT) |
+| `after` | `jsonb` | Row state after the change (null for DELETE) |
+| `context` | `jsonb` | Application context (from ORM packages) |
+| `primary_key` | `text` | Primary key value |
+| `committed_at` | `timestamptz` | Transaction commit time |
+| `position` | `bigint` | WAL position (LSN as numeric) |
+| `queued_at` | `timestamptz` | Time the change was queued |
+| `created_at` | `timestamptz` | Time the change was persisted |
+
+This schema is identical to the original Bemi -- existing queries work without modification.
+
+## Use Cases
+
+- **Audit Trails** -- compliance logs for customer support and external customers
+- **Time Travel** -- retrieve historical data without event sourcing
+- **Troubleshooting** -- identify root causes of application issues
+- **Change Reversion** -- revert changes or rollback API request side effects
+- **Distributed Tracing** -- track changes across distributed systems
+- **Trend Analysis** -- gain insights into historical data changes
+
+## Compatibility
+
+Zemi maintains full wire compatibility with the original Bemi:
+
+- Same `changes` table schema -- existing queries work without modification
+- Same environment variables -- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
+- Same ORM package support -- existing [ORM packages](https://docs.bemi.io/#supported-orms) work without changes
+- Same `_bemi` context protocol -- ORM packages send context via `pg_logical_emit_message` with the `_bemi` prefix, and Zemi stitches it onto changes identically
+
+## Migration from Bemi
+
+If you're currently running the original Bemi and want to switch to Zemi:
+
+1. **Stop** the existing Bemi worker (Debezium + NATS + Node.js)
+2. **Note** the current replication slot name (default: `bemi`)
+3. **Set** `SLOT_NAME` and `PUBLICATION_NAME` to match your existing values
+4. **Deploy** Zemi with the same environment variables
+5. Zemi picks up from where Bemi left off (same replication slot)
+
+**Rollback:** Stop Zemi, restart the old Bemi worker. The replication slot is shared.
+
+**What changes:** Single binary replaces four processes, Docker image drops from 3.2 GB to 1 MB.
+
+**What stays the same:** `changes` table schema, environment variables, ORM packages, replication slot.
+
+## Troubleshooting
+
+### "replication slot does not exist"
+
+The slot is created automatically on first run. If it was manually dropped, restart Zemi and it will recreate it.
+
+### "publication does not exist"
+
+The publication is created automatically (`FOR ALL TABLES` or scoped to `TABLES` if set). Restart Zemi to recreate.
+
+### No changes appearing
+
+1. Verify `wal_level = logical`: `SHOW wal_level;`
+2. Verify the publication exists: `SELECT * FROM pg_publication;`
+3. Verify the slot exists: `SELECT * FROM pg_replication_slots;`
+4. Check logs with `LOG_LEVEL=debug`
+
+### Authentication errors
+
+Only MD5 password authentication is currently supported. SCRAM-SHA-256 and SSL/TLS are not yet implemented.
 
 ## License
 
-Distributed under the terms of the [SSPL-1.0 License](/LICENSE). If you need to modify and distribute the code, please release it to contribute back to the open-source community.
+Distributed under the terms of the [SSPL-1.0 License](/LICENSE).

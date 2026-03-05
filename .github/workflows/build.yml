@@ -1,76 +1,102 @@
-name: Build
+name: CI
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
 
 permissions:
-  id-token: write
-  contents: read
+  contents: write
 
 jobs:
-  test-core:
-    name: Test core
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
-    - name: Check out code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: 21
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
 
-    - uses: pnpm/action-setup@v2
-      name: Install pnpm
-      with:
-        version: 8
-        run_install: false
+      - name: Run tests
+        run: zig build test
 
-    - name: Install dependencies
-      run: pnpm install
-      working-directory: ./core
+      - name: Build (verify compilation)
+        run: zig build
 
-    - name: Run typescript
-      run: pnpm tsc --noEmit
-      working-directory: ./core
-
-    - name: Run tests
-      run: pnpm jest
-      working-directory: ./core
-
-    - name: Run ESLint
-      run: pnpm lint
-      working-directory: ./core
-
-  build-local:
-    name: Build local docker image
+  release:
+    name: Release
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-    - name: Check out code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume: ${{ secrets.AWS_GH_ASSUME_ROLE }}
-        role-session-name: github-actions-bemi-local
-        aws-region: us-east-1
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
 
-    - name: Login to Amazon ECR Public
-      id: login-ecr-public
-      uses: aws-actions/amazon-ecr-login@v2
-      with:
-        registry-type: public
+      - name: Build release binaries
+        run: zig build release
 
-    - name: Build, tag, and push image to Amazon ECR
-      env:
-        REGISTRY: ${{ steps.login-ecr-public.outputs.registry }}
-        REGISTRY_ALIAS: bemi
-        REPOSITORY: dev
-        IMAGE_TAG: latest
-      run: |
-        cd worker
-        mv ../core ./core
-        docker build -t $REGISTRY/$REGISTRY_ALIAS/$REPOSITORY:$IMAGE_TAG .
-        docker push $REGISTRY/$REGISTRY_ALIAS/$REPOSITORY:$IMAGE_TAG
+      - name: Prepare release artifacts
+        run: |
+          mkdir -p release
+          cp zig-out/x86_64-linux/zemi release/zemi-x86_64-linux
+          cp zig-out/aarch64-linux/zemi release/zemi-aarch64-linux
+          cp zig-out/x86_64-macos/zemi release/zemi-x86_64-macos
+          cp zig-out/aarch64-macos/zemi release/zemi-aarch64-macos
+          cd release && sha256sum * > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+
+  docker:
+    name: Docker
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

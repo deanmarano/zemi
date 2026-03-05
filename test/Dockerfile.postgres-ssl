@@ -1,5 +1,6 @@
 # PostgreSQL with self-signed SSL certificates for testing
-FROM postgres:16-alpine
+ARG PG_VERSION=16
+FROM postgres:${PG_VERSION}-alpine
 
 # Generate self-signed SSL certificates
 RUN apk add --no-cache openssl && \

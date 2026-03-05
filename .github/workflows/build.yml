@@ -69,12 +69,16 @@ jobs:
           echo "::notice title=Binary size (${{ matrix.label }})::${SIZE_MB} MB (${SIZE_BYTES} bytes)"
 
   e2e:
-    name: E2E Tests
+    name: E2E Tests (PG ${{ matrix.pg }})
     runs-on: ubuntu-latest
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17]
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.pg }}-alpine
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -89,7 +93,7 @@ jobs:
         ports:
           - 5433:5432
       postgres-scram:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.pg }}-alpine
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -145,8 +149,10 @@ jobs:
 
       - name: Build and start SSL PostgreSQL
         run: |
-          # Build the SSL PostgreSQL image
-          docker build -t postgres-ssl-test -f test/Dockerfile.postgres-ssl .
+          # Build the SSL PostgreSQL image with the matrix PG version
+          docker build -t postgres-ssl-test \
+            --build-arg PG_VERSION=${{ matrix.pg }} \
+            -f test/Dockerfile.postgres-ssl .
 
           # Run the SSL PostgreSQL container
           docker run -d --name postgres-ssl \

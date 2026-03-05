@@ -314,21 +314,14 @@ This is transparent to callers — the main replication loop continues without c
 │   ├── phase-5-operations.md
 │   └── phase-6-testing-packaging.md
 ├── docs/zig-rewrite-plan.md    # High-level 6-phase plan
-├── core/                       # Original Bemi TypeScript core (unchanged)
-├── worker/                     # Original Bemi TypeScript worker (unchanged)
 ├── build.zig                   # Zig build configuration
 ├── build.zig.zon               # Zig package manifest
 ├── Dockerfile                  # Multi-stage: Alpine+Zig → scratch
 ├── docker-compose.test.yml     # Test PostgreSQL instances (MD5 + SCRAM + SSL)
 ├── .github/workflows/build.yml # CI/CD pipeline
 ├── .tool-versions              # asdf: zig 0.14.1
-├── Makefile                    # Original Bemi build targets
 └── README.md                   # Project documentation
 ```
-
-## Original Bemi Code
-
-The `core/` and `worker/` directories contain the original TypeScript/Node.js code from the BemiHQ/bemi-io project. These are **not modified** as part of the Zemi rewrite and remain for reference. The `Makefile` also contains original Bemi build targets.
 
 ## Current State (as of last session)
 

@@ -62,7 +62,7 @@ Layer 3:                 main.zig        (everything)
 
 ### File-by-File Guide
 
-**`src/protocol.zig`** (~755 lines, 9 tests)
+**`src/protocol.zig`** (~782 lines, 10 tests)
 PostgreSQL v3 wire protocol implementation. All the low-level message parsing and building.
 - `MessageReader` / `MessageWriter` — cursor-based binary reader/writer (big-endian, as PG requires)
 - `BackendMessage` / `FrontendMessage` — message type enums matching PG protocol bytes
@@ -72,7 +72,7 @@ PostgreSQL v3 wire protocol implementation. All the low-level message parsing an
 - Free functions: `buildStartupMessage`, `buildQueryMessage`, `computeMd5Password`, `parseErrorFields`, `parseDataRow`, `parseReplicationMessage`, `buildStandbyStatusUpdate`, `parseLsn`, `formatLsn`, `pgEpochMicroseconds`
 - Key detail: PostgreSQL uses big-endian byte order and a PG epoch of 2000-01-01 (not Unix epoch). The offset is `946_684_800_000_000` microseconds.
 
-**`src/connection.zig`** (~600 lines, 0 tests)
+**`src/connection.zig`** (~630 lines, 0 tests)
 TCP connection management with SSL/TLS negotiation and the full startup/authentication handshake.
 - `Connection` struct — holds TCP stream, 64KB read buffer, server params, optional `ScramClient` state, optional `tls.Client` and `Certificate.Bundle` for SSL
 - `connect()` — opens TCP, optionally negotiates SSL (SSLRequest → TLS handshake), sends startup message, handles auth (MD5 or SCRAM-SHA-256), processes ParameterStatus/BackendKeyData until ReadyForQuery
@@ -163,13 +163,13 @@ Application entry point and orchestration.
 
 ## Testing
 
-### Unit Tests (54 tests)
+### Unit Tests (53 tests)
 
 Run with `zig build test`. All tests are pulled in via `src/main.zig`'s test block which `@import`s all modules. Tests are in-file (Zig convention).
 
 | File | Tests | What's Tested |
 |------|-------|---------------|
-| protocol.zig | 9 | MessageReader, message builders, MD5 auth, LSN parse/format, replication message parsing |
+| protocol.zig | 10 | MessageReader, message builders, MD5 auth, LSN parse/format, replication message parsing, SSL request |
 | decoder.zig | 20 | All 10 pgoutput message types, RelationCache, full transaction decode (INSERT + TRUNCATE), primary key extraction, context stitching (4 scenarios + TRUNCATE) |
 | storage.zig | 10 | SQL building, escaping, JSON serialization, timestamp conversion, error classification |
 | scram.zig | 5 | Full SCRAM exchange, nonce mismatch, signature verification, SASL message formats |
@@ -178,14 +178,14 @@ Run with `zig build test`. All tests are pulled in via `src/main.zig`'s test blo
 
 **Important**: Zig's test runner treats `log.err` calls as test failures. Error-path tests must use `log.warn` instead.
 
-### E2E Integration Tests (35 assertions, 13 test groups)
+### E2E Integration Tests (40 assertions, 14 test groups)
 
 Run with `./test/e2e.sh` (uses Docker Compose) or `./test/e2e.sh --no-docker` (expects PostgreSQL already running on ports 5433, 5434, and 5435).
 
 The test script:
 1. Starts three PostgreSQL 16 instances: MD5 (port 5433), SCRAM-SHA-256 (port 5434), and SSL-enabled (port 5435)
 2. Builds Zemi from source
-3. Runs 13 test groups covering: connection, INSERT/UPDATE/DELETE/TRUNCATE tracking, data correctness, table filtering, context stitching, storage reconnection on DB restart, graceful shutdown cleanup, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca)
+3. Runs 14 test groups covering: connection, INSERT/UPDATE/DELETE/TRUNCATE tracking, data correctness, table filtering, context stitching, storage reconnection on DB restart, graceful shutdown cleanup, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca + verify-full), table filtering via TABLES env var
 4. Each test starts Zemi as a background process, performs SQL operations, waits, then queries the `changes` table
 
 **`docker-compose.test.yml`** — three PostgreSQL 16 Alpine services:
@@ -324,7 +324,7 @@ The `core/` and `worker/` directories contain the original TypeScript/Node.js co
 - SSL/TLS support (`src/connection.zig` — SSLRequest negotiation, TLS handshake, TLS-aware I/O wrappers)
 - SSL configuration (`src/config.zig` — `SslMode` enum, `DB_SSL_MODE`, `DB_SSL_ROOT_CERT`, dest fallbacks)
 - Graceful shutdown with slot/publication cleanup (`CLEANUP_ON_SHUTDOWN` env var, `replication.dropSlot()` + `replication.dropPublication()` via normal connections)
-- E2E integration tests (35 assertions across 13 test groups including reconnection, SCRAM, SSL, and graceful shutdown cleanup)
+- E2E integration tests (40 assertions across 14 test groups including reconnection, SCRAM, SSL verify-full, table filtering, and graceful shutdown cleanup)
 - Full CI pipeline with cross-compilation, E2E (MD5 + SCRAM + SSL), Docker, and release automation
 - Docusaurus documentation (5 Zemi pages + updated site config)
 - Rename from Bemi to Zemi throughout

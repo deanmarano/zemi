@@ -57,7 +57,8 @@ One process. One connection in (replication), one connection out (persistence). 
 | File | Purpose |
 |------|---------|
 | `src/protocol.zig` | PostgreSQL wire protocol encoding/decoding, replication messages, MD5 authentication (10 tests) |
-| `src/connection.zig` | TCP connection management, startup/auth handshake, simple query protocol |
+| `src/connection.zig` | TCP connection management, startup/auth handshake (MD5 + SCRAM-SHA-256), simple query protocol |
+| `src/scram.zig` | SCRAM-SHA-256 authentication (RFC 5802), PBKDF2, HMAC-SHA-256, SASL messages (5 tests) |
 | `src/replication.zig` | Logical replication stream, slot/publication management, WAL streaming |
 | `src/decoder.zig` | `pgoutput` logical decoding plugin parser, relation cache, context stitching (18 tests) |
 | `src/storage.zig` | Change persistence, schema migration, JSON serialization, retry logic (10 tests) |
@@ -65,11 +66,11 @@ One process. One connection in (replication), one connection out (persistence). 
 | `src/health.zig` | TCP health check server (1 test) |
 | `src/main.zig` | Entry point, signal handling, reconnection loop, graceful shutdown |
 
-**Total: 42 unit tests**
+**Total: 47 unit tests**
 
 ### Data Flow
 
-1. **Connection**: Zemi connects to PostgreSQL using the wire protocol, performs MD5 authentication, and enters replication mode.
+1. **Connection**: Zemi connects to PostgreSQL using the wire protocol, performs authentication (MD5 or SCRAM-SHA-256, auto-detected), and enters replication mode.
 
 2. **Publication & Slot**: On first run, Zemi creates a logical replication slot and publication (either `FOR ALL TABLES` or scoped to `TABLES` env var). On subsequent runs, it reuses the existing slot and resumes from the last acknowledged position.
 

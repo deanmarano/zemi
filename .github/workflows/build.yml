@@ -88,6 +88,21 @@ jobs:
           --health-retries 10
         ports:
           - 5433:5432
+      postgres-scram:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: zemi_test
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5434:5432
     steps:
       - uses: actions/checkout@v4
 
@@ -96,20 +111,35 @@ jobs:
         with:
           version: 0.14.1
 
-      - name: Configure PostgreSQL for logical replication
+      - name: Configure PostgreSQL instances for logical replication
         env:
           PGPASSWORD: postgres
         run: |
+          # Configure MD5 instance (port 5433)
           psql -h 127.0.0.1 -p 5433 -U postgres -d zemi_test -c "ALTER SYSTEM SET wal_level = 'logical';"
           psql -h 127.0.0.1 -p 5433 -U postgres -d zemi_test -c "ALTER SYSTEM SET max_replication_slots = 4;"
           psql -h 127.0.0.1 -p 5433 -U postgres -d zemi_test -c "ALTER SYSTEM SET max_wal_senders = 4;"
           psql -h 127.0.0.1 -p 5433 -U postgres -d zemi_test -c "ALTER SYSTEM SET password_encryption = 'md5';"
-          # Restart postgres to apply wal_level change (requires restart, not just reload)
-          docker restart $(docker ps -q --filter ancestor=postgres:16-alpine)
+
+          # Configure SCRAM instance (port 5434)
+          psql -h 127.0.0.1 -p 5434 -U postgres -d zemi_test -c "ALTER SYSTEM SET wal_level = 'logical';"
+          psql -h 127.0.0.1 -p 5434 -U postgres -d zemi_test -c "ALTER SYSTEM SET max_replication_slots = 4;"
+          psql -h 127.0.0.1 -p 5434 -U postgres -d zemi_test -c "ALTER SYSTEM SET max_wal_senders = 4;"
+
+          # Restart both instances to apply wal_level (requires restart, not just reload)
+          # Get container IDs by mapped port
+          MD5_CONTAINER=$(docker ps --format '{{.ID}} {{.Ports}}' | grep '5433->5432' | awk '{print $1}')
+          SCRAM_CONTAINER=$(docker ps --format '{{.ID}} {{.Ports}}' | grep '5434->5432' | awk '{print $1}')
+          docker restart "$MD5_CONTAINER" "$SCRAM_CONTAINER"
           sleep 3
-          # Wait for postgres to be ready again
+
+          # Wait for both instances to be ready
           for i in $(seq 1 30); do
-            if psql -h 127.0.0.1 -p 5433 -U postgres -d zemi_test -c "SELECT 1;" >/dev/null 2>&1; then break; fi
+            MD5_READY=false
+            SCRAM_READY=false
+            if psql -h 127.0.0.1 -p 5433 -U postgres -d zemi_test -c "SELECT 1;" >/dev/null 2>&1; then MD5_READY=true; fi
+            if psql -h 127.0.0.1 -p 5434 -U postgres -d zemi_test -c "SELECT 1;" >/dev/null 2>&1; then SCRAM_READY=true; fi
+            if [ "$MD5_READY" = true ] && [ "$SCRAM_READY" = true ]; then break; fi
             sleep 1
           done
 

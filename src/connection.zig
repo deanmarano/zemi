@@ -3,6 +3,7 @@ const mem = std.mem;
 const net = std.net;
 const posix = std.posix;
 const protocol = @import("protocol.zig");
+const scram = @import("scram.zig");
 
 const log = std.log.scoped(.connection);
 
@@ -31,17 +32,24 @@ pub const Connection = struct {
     backend_key: []const u8 = "",
     server_params: std.StringHashMap([]const u8),
     is_ready: bool = false,
+    scram_client: ?scram.ScramClient = null,
 
     pub const ConnectError = error{
         AuthenticationFailed,
         ServerError,
         UnsupportedAuthMethod,
         ConnectionRefused,
+        InvalidServerResponse,
+        ServerNonceMismatch,
+        ServerSignatureMismatch,
+        Base64DecodeFailed,
     } || net.Stream.ReadError || net.Stream.WriteError || std.mem.Allocator.Error || error{
         UnexpectedEndOfData,
         InvalidLsn,
         Overflow,
         InvalidCharacter,
+        WeakParameters,
+        OutputTooLong,
     };
 
     pub fn connect(
@@ -171,6 +179,11 @@ pub const Connection = struct {
         switch (auth_type) {
             .ok => {
                 log.debug("authentication successful", .{});
+                // Clean up SCRAM state if present
+                if (self.scram_client) |*sc| {
+                    sc.deinit();
+                    self.scram_client = null;
+                }
             },
             .cleartext_password => {
                 log.debug("server requests cleartext password", .{});
@@ -187,15 +200,67 @@ pub const Connection = struct {
                 try self.stream.writeAll(msg);
             },
             .sasl => {
-                // Read available SASL mechanisms
+                // Read available SASL mechanisms and check for SCRAM-SHA-256
+                var found_scram256 = false;
                 while (reader.remaining() > 0) {
                     const mech = reader.readString() catch break;
                     if (mech.len == 0) break;
                     log.debug("server offers SASL mechanism: {s}", .{mech});
+                    if (mem.eql(u8, mech, "SCRAM-SHA-256")) {
+                        found_scram256 = true;
+                    }
                 }
-                // SCRAM-SHA-256 is not yet implemented
-                log.err("SASL/SCRAM-SHA-256 authentication is not yet supported", .{});
-                return error.UnsupportedAuthMethod;
+
+                if (!found_scram256) {
+                    log.err("server does not offer SCRAM-SHA-256", .{});
+                    return error.UnsupportedAuthMethod;
+                }
+
+                // Initialize SCRAM client and send client-first-message
+                log.debug("starting SCRAM-SHA-256 authentication", .{});
+                var sc = scram.ScramClient.init(self.allocator, self.password);
+
+                const client_first = try sc.buildClientFirst();
+                defer self.allocator.free(client_first);
+
+                const msg = try scram.buildSaslInitialResponse(self.allocator, "SCRAM-SHA-256", client_first);
+                defer self.allocator.free(msg);
+                try self.stream.writeAll(msg);
+
+                self.scram_client = sc;
+            },
+            .sasl_continue => {
+                // Server sent server-first-message
+                const server_first = reader.readRemaining();
+                log.debug("received SCRAM server-first-message ({d} bytes)", .{server_first.len});
+
+                if (self.scram_client) |*sc| {
+                    const client_final = try sc.buildClientFinal(server_first);
+                    defer self.allocator.free(client_final);
+
+                    const msg = try scram.buildSaslResponse(self.allocator, client_final);
+                    defer self.allocator.free(msg);
+                    try self.stream.writeAll(msg);
+                } else {
+                    log.err("received SASL continue without prior SASL init", .{});
+                    return error.AuthenticationFailed;
+                }
+            },
+            .sasl_final => {
+                // Server sent server-final-message with signature
+                const server_final = reader.readRemaining();
+                log.debug("received SCRAM server-final-message ({d} bytes)", .{server_final.len});
+
+                if (self.scram_client) |*sc| {
+                    sc.verifyServerFinal(server_final) catch |err| {
+                        log.err("SCRAM server verification failed: {}", .{err});
+                        return error.AuthenticationFailed;
+                    };
+                    log.info("SCRAM-SHA-256 authentication verified", .{});
+                } else {
+                    log.err("received SASL final without prior SASL state", .{});
+                    return error.AuthenticationFailed;
+                }
             },
             else => {
                 log.err("unsupported authentication method: {d}", .{auth_type_raw});

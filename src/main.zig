@@ -296,4 +296,5 @@ test {
     _ = @import("decoder.zig");
     _ = @import("storage.zig");
     _ = @import("health.zig");
+    _ = @import("scram.zig");
 }

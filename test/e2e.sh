@@ -334,6 +334,91 @@ sleep 3
 CHANGES_COUNT_2=$(query "SELECT COUNT(*) FROM changes;")
 assert_eq "changes table doesn't trigger recursive tracking" "$CHANGES_COUNT_1" "$CHANGES_COUNT_2"
 
+# ---------------------------------------------------------------------------
+# Test 9: SCRAM-SHA-256 authentication
+# ---------------------------------------------------------------------------
+echo ""
+echo "$(bold "[Test 9] SCRAM-SHA-256 authentication")"
+
+SCRAM_PORT="${SCRAM_PORT:-5434}"
+SCRAM_PSQL="psql -h $DB_HOST -p $SCRAM_PORT -U $DB_USER -d $DB_NAME -X -q"
+SCRAM_ZEMI_PID=""
+
+scram_query() {
+    PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -t -A -c "$1" 2>/dev/null
+}
+
+scram_cleanup() {
+    if [ -n "$SCRAM_ZEMI_PID" ] && kill -0 "$SCRAM_ZEMI_PID" 2>/dev/null; then
+        kill "$SCRAM_ZEMI_PID" 2>/dev/null || true
+        wait "$SCRAM_ZEMI_PID" 2>/dev/null || true
+    fi
+    PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -c "SELECT pg_drop_replication_slot('zemi_scram_test');" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -c "DROP PUBLICATION IF EXISTS zemi_scram_pub;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -c "DROP TABLE IF EXISTS scram_test_items CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
+}
+
+# Check if SCRAM PostgreSQL is available (skip if --no-docker without SCRAM PG)
+SCRAM_AVAILABLE=false
+for i in $(seq 1 15); do
+    if PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -c "SELECT 1;" >/dev/null 2>&1; then
+        SCRAM_AVAILABLE=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "$SCRAM_AVAILABLE" = true ]; then
+    # Clean up any previous state
+    scram_cleanup
+
+    # Create test table and publication on SCRAM PostgreSQL
+    scram_query "CREATE TABLE scram_test_items (id SERIAL PRIMARY KEY, name TEXT NOT NULL);"
+    scram_query "CREATE PUBLICATION zemi_scram_pub FOR TABLE scram_test_items;"
+
+    # Start a second Zemi instance against SCRAM PostgreSQL
+    DB_PORT="$SCRAM_PORT" \
+    SLOT_NAME="zemi_scram_test" \
+    PUBLICATION_NAME="zemi_scram_pub" \
+    "$ZEMI_BIN" > /tmp/zemi-e2e-scram.log 2>&1 &
+    SCRAM_ZEMI_PID=$!
+
+    sleep 3
+
+    if kill -0 "$SCRAM_ZEMI_PID" 2>/dev/null; then
+        assert_eq "Zemi connects with SCRAM-SHA-256" "running" "running"
+
+        # Insert a row and verify it's tracked
+        scram_query "INSERT INTO scram_test_items (name) VALUES ('scram-test-item');"
+
+        # Wait for the change to be captured
+        SCRAM_ELAPSED=0
+        while [ "$SCRAM_ELAPSED" -lt 15 ]; do
+            SCRAM_COUNT=$(scram_query "SELECT COUNT(*) FROM changes WHERE \"table\" = 'scram_test_items';" 2>/dev/null || echo "0")
+            if [ "$SCRAM_COUNT" -ge 1 ]; then break; fi
+            sleep 1
+            SCRAM_ELAPSED=$((SCRAM_ELAPSED + 1))
+        done
+
+        SCRAM_OP=$(scram_query "SELECT operation FROM changes WHERE \"table\" = 'scram_test_items' LIMIT 1;")
+        assert_eq "SCRAM: INSERT tracked as CREATE" "CREATE" "$SCRAM_OP"
+
+        SCRAM_AFTER=$(scram_query "SELECT after->>'name' FROM changes WHERE \"table\" = 'scram_test_items' LIMIT 1;")
+        assert_eq "SCRAM: after contains inserted data" "scram-test-item" "$SCRAM_AFTER"
+    else
+        echo "  $(red "FAIL") Zemi failed to start with SCRAM-SHA-256"
+        echo "  --- SCRAM Zemi logs:"
+        cat /tmp/zemi-e2e-scram.log
+        FAIL=$((FAIL + 3))
+        TOTAL=$((TOTAL + 3))
+    fi
+
+    scram_cleanup
+else
+    echo "  SKIP: SCRAM PostgreSQL not available on port $SCRAM_PORT"
+fi
+
 # ===========================================================================
 # RESULTS
 # ===========================================================================

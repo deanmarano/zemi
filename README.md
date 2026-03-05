@@ -188,7 +188,8 @@ Zemi reads the WAL and writes to PostgreSQL. That's it. One process, one connect
 ```
 
 - **protocol.zig** -- PostgreSQL wire protocol encoding/decoding, replication messages, MD5 auth
-- **connection.zig** -- TCP connection management, startup/auth handshake, simple query protocol
+- **connection.zig** -- TCP connection management, startup/auth handshake (MD5 + SCRAM-SHA-256), simple query protocol
+- **scram.zig** -- SCRAM-SHA-256 authentication (RFC 5802), PBKDF2, HMAC-SHA-256, SASL message building
 - **replication.zig** -- Logical replication stream, slot/publication management, WAL streaming
 - **decoder.zig** -- `pgoutput` logical decoding plugin parser, relation cache, context stitching
 - **storage.zig** -- Change persistence, schema migration, JSON serialization, retry logic
@@ -310,9 +311,9 @@ The publication is created automatically (`FOR ALL TABLES` or scoped to `TABLES`
 3. Verify the slot exists: `SELECT * FROM pg_replication_slots;`
 4. Check logs with `LOG_LEVEL=debug`
 
-### Authentication errors
+### Authentication
 
-Only MD5 password authentication is currently supported. SCRAM-SHA-256 and SSL/TLS are not yet implemented.
+Zemi supports both **MD5** and **SCRAM-SHA-256** password authentication. SCRAM-SHA-256 is the default in PostgreSQL 16+ and is recommended for production use. SSL/TLS is not yet implemented.
 
 ## License
 

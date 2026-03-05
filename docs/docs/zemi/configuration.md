@@ -130,6 +130,7 @@ The `changes` table is always excluded from tracking to prevent recursive WAL ev
 | `LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, `error` | `info` |
 | `HEALTH_PORT` | TCP port for health check endpoint | disabled |
 | `SHUTDOWN_TIMEOUT` | Seconds to wait for graceful shutdown | `30` |
+| `CLEANUP_ON_SHUTDOWN` | Drop replication slot and publication on graceful shutdown | `false` |
 
 ### Log Levels
 
@@ -159,10 +160,24 @@ On receiving `SIGTERM` or `SIGINT`:
 1. Zemi stops accepting new WAL messages
 2. Persists any buffered changes
 3. Sends a final StandbyStatusUpdate to PostgreSQL (acknowledges the last processed WAL position)
-4. Closes all connections
-5. Exits
+4. If `CLEANUP_ON_SHUTDOWN` is enabled, drops the replication slot and publication
+5. Closes all connections
+6. Exits
 
 If a second signal is received before shutdown completes, Zemi exits immediately.
+
+#### Cleanup on Shutdown
+
+When `CLEANUP_ON_SHUTDOWN=true`, Zemi drops the replication slot and publication during graceful shutdown. This is useful for:
+
+- **Ephemeral environments** (CI, staging, preview deployments) where you don't want leftover slots consuming WAL
+- **Clean teardown** when decommissioning a Zemi instance
+
+Accepts `true`, `1`, or `yes` (case-sensitive).
+
+:::warning
+With cleanup enabled, stopping and restarting Zemi creates a **new** replication slot. Any WAL changes that occurred while Zemi was stopped will be missed. Only enable this if you don't need continuous change tracking across restarts.
+:::
 
 ## Example: Minimal
 
@@ -190,6 +205,7 @@ TABLES=users,orders,payments \
 LOG_LEVEL=info \
 HEALTH_PORT=4005 \
 SHUTDOWN_TIMEOUT=60 \
+CLEANUP_ON_SHUTDOWN=false \
 ./zig-out/bin/zemi
 ```
 

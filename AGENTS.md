@@ -92,7 +92,7 @@ SCRAM-SHA-256 authentication (RFC 5802) for PostgreSQL 14+.
 - `buildSaslInitialResponse()` / `buildSaslResponse()` — PostgreSQL SASL message builders
 - Key detail: `"biws"` is base64 of `"n,,"` (GS2 channel binding header). The `initWithNonce()` constructor allows deterministic test vectors.
 
-**`src/replication.zig`** (~218 lines, 0 tests)
+**`src/replication.zig`** (~278 lines, 0 tests)
 Replication slot and WAL stream management.
 - `ReplicationStream` — wraps a `Connection` opened with `replication="database"`
 - `identifySystem()` — `IDENTIFY_SYSTEM` command
@@ -101,7 +101,9 @@ Replication slot and WAL stream management.
 - `poll()` — reads one CopyData, returns XLogData or handles keepalive (auto-responds when `reply_requested`)
 - `confirmLsn()` — advances the flushed LSN (monotonically increasing only)
 - `ensurePublication()` — creates publication via a separate non-replication connection
-- Key detail: `messages 'true'` in START_REPLICATION options is required for `_bemi` context messages to be forwarded via pgoutput.
+- `dropPublication()` — drops the publication via a normal connection (best-effort, used during cleanup on shutdown)
+- `dropSlot()` — drops the replication slot via a normal connection using `pg_drop_replication_slot()` (best-effort, used during cleanup on shutdown)
+- Key detail: `messages 'true'` in START_REPLICATION options is required for `_bemi` context messages to be forwarded via pgoutput. Slot/publication cleanup uses separate normal connections because the replication connection is in CopyBoth mode and cannot issue DDL.
 
 **`src/decoder.zig`** (~1,600 lines, 20 tests)
 pgoutput logical decoding message parser and transaction state machine.
@@ -122,14 +124,15 @@ Change persistence to PostgreSQL with schema migration and retry logic.
 - The `changes` table schema has 14 columns including UUID PK, JSONB before/after/context, GIN indexes, and a unique constraint on (position, table, schema, database, operation) for deduplication.
 - Key detail: The `changes` table itself must be filtered from tracking (in `main.zig`) to prevent infinite recursive WAL events.
 
-**`src/config.zig`** (~280 lines, 7 tests)
+**`src/config.zig`** (~345 lines, 7 tests)
 Environment variable configuration.
 - `SslMode` enum — `disable`, `require`, `verify_ca`, `verify_full` with `fromString()`/`toString()` conversion
 - `Config` struct — all settings with defaults. Slot and publication names default to `"zemi"`.
-- `fromEnv()` — reads 20 environment variables (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DB_SSL_MODE, DB_SSL_ROOT_CERT, SLOT_NAME, PUBLICATION_NAME, DEST_DB_*, LOG_LEVEL, TABLES, SHUTDOWN_TIMEOUT, HEALTH_PORT)
+- `fromEnv()` — reads 21 environment variables (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DB_SSL_MODE, DB_SSL_ROOT_CERT, SLOT_NAME, PUBLICATION_NAME, DEST_DB_*, LOG_LEVEL, TABLES, SHUTDOWN_TIMEOUT, HEALTH_PORT, CLEANUP_ON_SHUTDOWN)
 - `getDestSslMode()` / `getDestSslRootCert()` — destination SSL settings with fallback to source DB settings
 - `shouldTrackTable()` — comma-separated table filter with whitespace trimming
 - `validate()` — returns first validation error message or null
+- `cleanup_on_shutdown` — when true, drops replication slot and publication on graceful shutdown
 - Destination DB fields (`DEST_DB_*`) fall back to source DB fields when unset.
 
 **`src/health.zig`** (~89 lines, 1 test)
@@ -173,14 +176,14 @@ Run with `zig build test`. All tests are pulled in via `src/main.zig`'s test blo
 
 **Important**: Zig's test runner treats `log.err` calls as test failures. Error-path tests must use `log.warn` instead.
 
-### E2E Integration Tests (29 assertions, 11 test groups)
+### E2E Integration Tests (33 assertions, 12 test groups)
 
 Run with `./test/e2e.sh` (uses Docker Compose) or `./test/e2e.sh --no-docker` (expects PostgreSQL already running on ports 5433, 5434, and 5435).
 
 The test script:
 1. Starts three PostgreSQL 16 instances: MD5 (port 5433), SCRAM-SHA-256 (port 5434), and SSL-enabled (port 5435)
 2. Builds Zemi from source
-3. Runs 11 test groups covering: connection, INSERT/UPDATE/DELETE/TRUNCATE tracking, data correctness, table filtering, context stitching, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca)
+3. Runs 12 test groups covering: connection, INSERT/UPDATE/DELETE/TRUNCATE tracking, data correctness, table filtering, context stitching, graceful shutdown cleanup, SCRAM-SHA-256 auth, SSL/TLS connections (require + verify-ca)
 4. Each test starts Zemi as a background process, performs SQL operations, waits, then queries the `changes` table
 
 **`docker-compose.test.yml`** — three PostgreSQL 16 Alpine services:
@@ -308,14 +311,14 @@ The `core/` and `worker/` directories contain the original TypeScript/Node.js co
 - SCRAM-SHA-256 authentication (`src/scram.zig` + `src/connection.zig` updates)
 - SSL/TLS support (`src/connection.zig` — SSLRequest negotiation, TLS handshake, TLS-aware I/O wrappers)
 - SSL configuration (`src/config.zig` — `SslMode` enum, `DB_SSL_MODE`, `DB_SSL_ROOT_CERT`, dest fallbacks)
-- E2E integration tests (29 assertions across 11 test groups including SCRAM and SSL)
+- Graceful shutdown with slot/publication cleanup (`CLEANUP_ON_SHUTDOWN` env var, `replication.dropSlot()` + `replication.dropPublication()` via normal connections)
+- E2E integration tests (33 assertions across 12 test groups including SCRAM, SSL, and graceful shutdown cleanup)
 - Full CI pipeline with cross-compilation, E2E (MD5 + SCRAM + SSL), Docker, and release automation
 - Docusaurus documentation (5 Zemi pages + updated site config)
 - Rename from Bemi to Zemi throughout
 
 ### Potential Future Work
 - **Observability/metrics** — Prometheus endpoint for monitoring
-- **Graceful slot/publication cleanup on shutdown**
 - **Connection pooling for storage** — currently single connection
 
 ## How to Work on This Codebase

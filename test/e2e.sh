@@ -360,10 +360,72 @@ TRUNC_PK=$(query "SELECT primary_key FROM changes WHERE operation = 'TRUNCATE' A
 assert_eq "primary_key is empty for TRUNCATE" "" "$TRUNC_PK"
 
 # ---------------------------------------------------------------------------
-# Test 10: SCRAM-SHA-256 authentication
+# Test 10: Graceful shutdown cleanup (CLEANUP_ON_SHUTDOWN)
 # ---------------------------------------------------------------------------
 echo ""
-echo "$(bold "[Test 10] SCRAM-SHA-256 authentication")"
+echo "$(bold "[Test 10] Graceful shutdown cleanup")"
+
+CLEANUP_SLOT="zemi_cleanup_test"
+CLEANUP_PUB="zemi_cleanup_pub"
+CLEANUP_ZEMI_PID=""
+
+cleanup_test_teardown() {
+    if [ -n "$CLEANUP_ZEMI_PID" ] && kill -0 "$CLEANUP_ZEMI_PID" 2>/dev/null; then
+        kill "$CLEANUP_ZEMI_PID" 2>/dev/null || true
+        wait "$CLEANUP_ZEMI_PID" 2>/dev/null || true
+    fi
+    # Best-effort cleanup in case the test fails
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SELECT pg_drop_replication_slot('$CLEANUP_SLOT');" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $CLEANUP_PUB;" 2>/dev/null || true
+}
+
+# Start Zemi with CLEANUP_ON_SHUTDOWN=true and a dedicated slot/publication
+CLEANUP_ON_SHUTDOWN=true \
+SLOT_NAME="$CLEANUP_SLOT" \
+PUBLICATION_NAME="$CLEANUP_PUB" \
+"$ZEMI_BIN" > /tmp/zemi-e2e-cleanup.log 2>&1 &
+CLEANUP_ZEMI_PID=$!
+
+sleep 3
+
+if kill -0 "$CLEANUP_ZEMI_PID" 2>/dev/null; then
+    # Verify the slot was created
+    SLOT_EXISTS=$(query "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = '$CLEANUP_SLOT';")
+    assert_eq "cleanup: slot created" "1" "$SLOT_EXISTS"
+
+    # Verify the publication was created
+    PUB_EXISTS=$(query "SELECT COUNT(*) FROM pg_publication WHERE pubname = '$CLEANUP_PUB';")
+    assert_eq "cleanup: publication created" "1" "$PUB_EXISTS"
+
+    # Send SIGTERM for graceful shutdown
+    kill "$CLEANUP_ZEMI_PID" 2>/dev/null || true
+    wait "$CLEANUP_ZEMI_PID" 2>/dev/null || true
+    CLEANUP_ZEMI_PID=""
+
+    # Give PostgreSQL a moment to release resources
+    sleep 1
+
+    # Verify the slot was dropped
+    SLOT_AFTER=$(query "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = '$CLEANUP_SLOT';")
+    assert_eq "cleanup: slot dropped on shutdown" "0" "$SLOT_AFTER"
+
+    # Verify the publication was dropped
+    PUB_AFTER=$(query "SELECT COUNT(*) FROM pg_publication WHERE pubname = '$CLEANUP_PUB';")
+    assert_eq "cleanup: publication dropped on shutdown" "0" "$PUB_AFTER"
+else
+    echo "  $(red "FAIL") Zemi failed to start for cleanup test"
+    echo "  --- Cleanup test Zemi logs:"
+    cat /tmp/zemi-e2e-cleanup.log
+    FAIL=$((FAIL + 4))
+    TOTAL=$((TOTAL + 4))
+    cleanup_test_teardown
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11: SCRAM-SHA-256 authentication
+# ---------------------------------------------------------------------------
+echo ""
+echo "$(bold "[Test 11] SCRAM-SHA-256 authentication")"
 
 SCRAM_PORT="${SCRAM_PORT:-5434}"
 SCRAM_PSQL="psql -h $DB_HOST -p $SCRAM_PORT -U $DB_USER -d $DB_NAME -X -q"
@@ -445,10 +507,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 11: SSL/TLS connection (sslmode=require)
+# Test 12: SSL/TLS connection (sslmode=require)
 # ---------------------------------------------------------------------------
 echo ""
-echo "$(bold "[Test 11] SSL/TLS connection")"
+echo "$(bold "[Test 12] SSL/TLS connection")"
 
 SSL_PORT="${SSL_PORT:-5435}"
 SSL_PSQL="psql -h $DB_HOST -p $SSL_PORT -U $DB_USER -d $DB_NAME -X -q"
@@ -492,8 +554,8 @@ if [ "$SSL_AVAILABLE" = true ]; then
         ssl_query "CREATE TABLE ssl_test_items (id SERIAL PRIMARY KEY, name TEXT NOT NULL);"
         ssl_query "CREATE PUBLICATION zemi_ssl_pub FOR TABLE ssl_test_items;"
 
-        # --- Test 11a: sslmode=require (no cert verification) ---
-        echo "  $(bold "11a: sslmode=require")"
+        # --- Test 12a: sslmode=require (no cert verification) ---
+        echo "  $(bold "12a: sslmode=require")"
 
         DB_PORT="$SSL_PORT" \
         DB_SSL_MODE="require" \
@@ -538,8 +600,8 @@ if [ "$SSL_AVAILABLE" = true ]; then
         fi
         SSL_ZEMI_PID=""
 
-        # --- Test 11b: sslmode=verify-ca with root cert ---
-        echo "  $(bold "11b: sslmode=verify-ca")"
+        # --- Test 12b: sslmode=verify-ca with root cert ---
+        echo "  $(bold "12b: sslmode=verify-ca")"
 
         # Extract the CA certificate from the SSL container
         SSL_CERT_DIR="/tmp/zemi-ssl-certs"
@@ -551,7 +613,7 @@ if [ "$SSL_AVAILABLE" = true ]; then
         fi
 
         if [ -f "$SSL_CERT_DIR/root.crt" ]; then
-            # Clean up changes from 11a
+            # Clean up changes from 12a
             ssl_query "DELETE FROM changes;"
             ssl_query "DELETE FROM ssl_test_items;"
 

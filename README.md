@@ -140,6 +140,7 @@ SSL modes:
 | `TABLES` | Comma-separated list of tables to track (empty = all) | all tables |
 | `HEALTH_PORT` | TCP port for health check endpoint (empty = disabled) | disabled |
 | `SHUTDOWN_TIMEOUT` | Seconds to wait for graceful shutdown | `30` |
+| `CLEANUP_ON_SHUTDOWN` | Drop replication slot and publication on graceful shutdown (`true`/`1`/`yes`) | `false` |
 
 ### Health Check
 

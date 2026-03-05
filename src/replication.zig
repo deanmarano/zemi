@@ -105,20 +105,6 @@ pub const ReplicationStream = struct {
         log.info("replication slot '{s}' ready", .{self.config.slot_name});
     }
 
-    /// Drop the replication slot.
-    pub fn dropSlot(self: *ReplicationStream) !void {
-        var buf: [128]u8 = undefined;
-        const sql = std.fmt.bufPrint(&buf, "DROP_REPLICATION_SLOT {s} WAIT", .{
-            self.config.slot_name,
-        }) catch return error.ServerError;
-
-        self.conn.exec(sql) catch |err| {
-            log.warn("failed to drop replication slot: {}", .{err});
-            return err;
-        };
-        log.info("dropped replication slot '{s}'", .{self.config.slot_name});
-    }
-
     /// Start streaming WAL changes from the given LSN position.
     /// If start_lsn is 0, streams from the slot's confirmed_flush_lsn.
     pub fn startReplication(self: *ReplicationStream, start_lsn: u64) !void {
@@ -219,4 +205,74 @@ pub fn ensurePublication(allocator: std.mem.Allocator, config: Config) !void {
     };
 
     log.info("publication '{s}' ready", .{config.publication_name});
+}
+
+/// Drop the publication. Uses a normal (non-replication) connection.
+/// Best-effort: logs a warning and returns on failure.
+pub fn dropPublication(allocator: std.mem.Allocator, config: Config) void {
+    var conn = Connection.connect(
+        allocator,
+        config.db_host,
+        config.db_port,
+        config.db_user,
+        config.db_password,
+        config.db_name,
+        null, // normal connection
+        config.db_ssl_mode,
+        config.db_ssl_root_cert,
+    ) catch |err| {
+        log.warn("failed to connect for publication cleanup: {}", .{err});
+        return;
+    };
+    defer conn.close();
+
+    var buf: [256]u8 = undefined;
+    const sql = std.fmt.bufPrint(&buf, "DROP PUBLICATION IF EXISTS {s}", .{
+        config.publication_name,
+    }) catch {
+        log.warn("failed to format DROP PUBLICATION query", .{});
+        return;
+    };
+
+    conn.exec(sql) catch |err| {
+        log.warn("failed to drop publication '{s}': {}", .{ config.publication_name, err });
+        return;
+    };
+
+    log.info("dropped publication '{s}'", .{config.publication_name});
+}
+
+/// Drop the replication slot. Uses a normal (non-replication) connection.
+/// Best-effort: logs a warning and returns on failure.
+pub fn dropSlot(allocator: std.mem.Allocator, config: Config) void {
+    var conn = Connection.connect(
+        allocator,
+        config.db_host,
+        config.db_port,
+        config.db_user,
+        config.db_password,
+        config.db_name,
+        null, // normal connection
+        config.db_ssl_mode,
+        config.db_ssl_root_cert,
+    ) catch |err| {
+        log.warn("failed to connect for slot cleanup: {}", .{err});
+        return;
+    };
+    defer conn.close();
+
+    var buf: [256]u8 = undefined;
+    const sql = std.fmt.bufPrint(&buf, "SELECT pg_drop_replication_slot('{s}')", .{
+        config.slot_name,
+    }) catch {
+        log.warn("failed to format slot drop query", .{});
+        return;
+    };
+
+    conn.exec(sql) catch |err| {
+        log.warn("failed to drop replication slot '{s}': {}", .{ config.slot_name, err });
+        return;
+    };
+
+    log.info("dropped replication slot '{s}'", .{config.slot_name});
 }

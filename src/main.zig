@@ -130,6 +130,13 @@ pub fn main() !void {
         break;
     }
 
+    // Cleanup: drop replication slot and publication if configured
+    if (config.cleanup_on_shutdown) {
+        log.info("CLEANUP_ON_SHUTDOWN enabled, removing slot and publication...", .{});
+        replication.dropSlot(allocator, config);
+        replication.dropPublication(allocator, config);
+    }
+
     log.info("zemi shutdown complete", .{});
 }
 
@@ -282,11 +289,6 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config) !void {
     }
 
     log.info("shutdown requested, flushing {d} changes processed in {d} transactions...", .{ changes_count, tx_count });
-
-    // Send final status update before exit
-    stream.sendStatusUpdate() catch |err| {
-        log.warn("failed to send final status update: {}", .{err});
-    };
 }
 
 // Pull in tests from all modules

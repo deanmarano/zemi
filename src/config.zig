@@ -71,6 +71,7 @@ pub const Config = struct {
     // Operational settings
     shutdown_timeout_secs: u32 = 30,
     health_port: ?u16 = null, // null = health check disabled
+    cleanup_on_shutdown: bool = false, // drop slot + publication on graceful shutdown
 
     /// Returns the effective destination host (falls back to source).
     pub fn getDestHost(self: Config) []const u8 {
@@ -190,6 +191,12 @@ pub const Config = struct {
             };
         }
 
+        if (std.posix.getenv("CLEANUP_ON_SHUTDOWN")) |v| {
+            if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "yes")) {
+                config.cleanup_on_shutdown = true;
+            }
+        }
+
         return config;
     }
 
@@ -245,9 +252,10 @@ pub const Config = struct {
         } else {
             log.info("config: tracking all tables", .{});
         }
-        log.info("config: log_level={s} shutdown_timeout={d}s", .{
+        log.info("config: log_level={s} shutdown_timeout={d}s cleanup_on_shutdown={}", .{
             @tagName(self.log_level),
             self.shutdown_timeout_secs,
+            self.cleanup_on_shutdown,
         });
         if (self.health_port) |port| {
             log.info("config: health_port={d}", .{port});

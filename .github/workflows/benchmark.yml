@@ -1,0 +1,109 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "test/benchmark.sh"
+      - "docker-compose.benchmark.yml"
+      - ".github/workflows/benchmark.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "test/benchmark.sh"
+      - "docker-compose.benchmark.yml"
+      - ".github/workflows/benchmark.yml"
+  workflow_dispatch:
+  schedule:
+    # Weekly on Sundays at 06:00 UTC
+    - cron: "0 6 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Zemi vs Bemi Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      # Source PostgreSQL — tracked database where load is generated
+      postgres-source:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: bench_source
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: md5
+          POSTGRES_INITDB_ARGS: "--auth-host=md5"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5440:5432
+      # Destination PostgreSQL — where changes are persisted
+      postgres-dest:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: bench_dest
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: md5
+          POSTGRES_INITDB_ARGS: "--auth-host=md5"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5441:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Configure source PostgreSQL for logical replication
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h 127.0.0.1 -p 5440 -U postgres -d bench_source -c "ALTER SYSTEM SET wal_level = 'logical';"
+          psql -h 127.0.0.1 -p 5440 -U postgres -d bench_source -c "ALTER SYSTEM SET max_replication_slots = 4;"
+          psql -h 127.0.0.1 -p 5440 -U postgres -d bench_source -c "ALTER SYSTEM SET max_wal_senders = 4;"
+
+          # Restart to apply wal_level change
+          SOURCE_CONTAINER=$(docker ps --format '{{.ID}} {{.Ports}}' | grep '5440->5432' | awk '{print $1}')
+          docker restart "$SOURCE_CONTAINER"
+          sleep 3
+
+          # Wait for PostgreSQL to be ready
+          for i in $(seq 1 30); do
+            if psql -h 127.0.0.1 -p 5440 -U postgres -d bench_source -c "SELECT 1;" >/dev/null 2>&1; then
+              echo "Source PostgreSQL is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Build Zemi
+        run: zig build
+
+      - name: Pull Bemi image
+        run: docker pull public.ecr.aws/bemi/dev:latest
+
+      - name: Run benchmarks
+        run: ./test/benchmark.sh --skip-docker --no-build
+
+      - name: Show benchmark summary
+        if: always()
+        run: |
+          if [ -f /tmp/benchmark-summary.md ]; then
+            cat /tmp/benchmark-summary.md
+          fi

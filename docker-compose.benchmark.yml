@@ -1,0 +1,67 @@
+# Benchmark infrastructure: source PG + destination PG
+# Zemi runs as a native binary on the host (built from source or Docker)
+# Bemi runs via its Docker image: public.ecr.aws/bemi/dev:latest
+#
+# Usage:
+#   docker compose -f docker-compose.benchmark.yml up -d
+#   ./test/benchmark.sh
+#   docker compose -f docker-compose.benchmark.yml down -v
+
+services:
+  # Source PostgreSQL — tracked database where load is generated
+  postgres-source:
+    image: postgres:16-alpine
+    ports:
+      - "5440:5432"
+    environment:
+      POSTGRES_DB: bench_source
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - max_connections=200
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # Destination PostgreSQL — where changes are persisted
+  postgres-dest:
+    image: postgres:16-alpine
+    ports:
+      - "5441:5432"
+    environment:
+      POSTGRES_DB: bench_dest
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - max_connections=200
+      - -c
+      - synchronous_commit=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10

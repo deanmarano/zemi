@@ -48,6 +48,12 @@ pub const Metrics = struct {
     /// Mid-transaction flushes due to MAX_TRANSACTION_CHANGES limit.
     transaction_early_flushes_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    /// Total replication errors classified as transient (retryable).
+    replication_transient_errors_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// Total replication errors classified as permanent (non-retryable).
+    replication_permanent_errors_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     // --- Gauges (current value) ---
 
     /// Highest WAL position received.
@@ -102,6 +108,8 @@ pub const Metrics = struct {
         const storage_reconns = self.storage_reconnections_total.load(.monotonic);
         const repl_reconns = self.replication_reconnections_total.load(.monotonic);
         const early_flushes = self.transaction_early_flushes_total.load(.monotonic);
+        const repl_transient_errs = self.replication_transient_errors_total.load(.monotonic);
+        const repl_permanent_errs = self.replication_permanent_errors_total.load(.monotonic);
         const received_lsn = self.last_received_lsn.load(.monotonic);
         const flushed_lsn = self.last_flushed_lsn.load(.monotonic);
         const lag = if (received_lsn >= flushed_lsn) received_lsn - flushed_lsn else 0;
@@ -130,6 +138,8 @@ pub const Metrics = struct {
             try appendSimpleCounterPrefixed(&buf, prefix, "storage_reconnections_total", "Total storage reconnections.", storage_reconns);
             try appendSimpleCounterPrefixed(&buf, prefix, "replication_reconnections_total", "Total replication reconnections.", repl_reconns);
             try appendSimpleCounterPrefixed(&buf, prefix, "transaction_early_flushes_total", "Mid-transaction flushes due to MAX_TRANSACTION_CHANGES limit.", early_flushes);
+            try appendSimpleCounterPrefixed(&buf, prefix, "replication_transient_errors_total", "Replication errors classified as transient (retryable).", repl_transient_errs);
+            try appendSimpleCounterPrefixed(&buf, prefix, "replication_permanent_errors_total", "Replication errors classified as permanent (non-retryable).", repl_permanent_errs);
 
             // Gauges
             try appendSimpleGaugePrefixed(&buf, prefix, "replication_lag_bytes", "Replication lag in bytes (received - flushed LSN).", lag);
@@ -478,4 +488,20 @@ test "Metrics.render shows zero for transaction_early_flushes_total by default" 
     defer std.testing.allocator.free(output);
 
     try std.testing.expect(std.mem.indexOf(u8, output, "zemi_transaction_early_flushes_total 0") != null);
+}
+
+test "Metrics.render includes replication error counters" {
+    var m = Metrics{ .start_time_secs = std.time.timestamp() };
+    Metrics.inc(&m.replication_transient_errors_total);
+    Metrics.inc(&m.replication_transient_errors_total);
+    Metrics.inc(&m.replication_permanent_errors_total);
+
+    const output = try m.render(std.testing.allocator);
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "# HELP zemi_replication_transient_errors_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_replication_transient_errors_total 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_replication_permanent_errors_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bemi_replication_transient_errors_total 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bemi_replication_permanent_errors_total 1") != null);
 }

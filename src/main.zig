@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const Connection = @import("connection.zig").Connection;
 const Config = @import("config.zig").Config;
 const ReplicationStream = @import("replication.zig").ReplicationStream;
 const replication = @import("replication.zig");
@@ -73,6 +74,25 @@ fn installSignalHandlers() void {
     posix.sigaction(posix.SIG.TERM, &sa, null);
 }
 
+/// Classify whether a replication-loop error is permanent (non-retryable).
+/// Permanent errors are caused by misconfiguration (bad credentials, missing
+/// SSL certs, etc.) and retrying won't help without operator intervention.
+/// Returns true for permanent errors, false for transient (network, server restart, etc.).
+fn isPermanentError(err: anyerror) bool {
+    return switch (err) {
+        error.AuthenticationFailed,
+        error.UnsupportedAuthMethod,
+        error.SslNotSupported,
+        error.SslCertificateError,
+        error.ServerNonceMismatch,
+        error.ServerSignatureMismatch,
+        error.Base64DecodeFailed,
+        error.WeakParameters,
+        => true,
+        else => false,
+    };
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -132,6 +152,8 @@ pub fn main() !void {
 
     // Main loop with reconnection
     var attempt: u32 = 0;
+    var permanent_attempt: u32 = 0;
+    const max_permanent_retries: u32 = 3;
     const max_backoff_secs: u64 = 60;
 
     while (!shutdown_requested.load(.acquire)) {
@@ -141,12 +163,31 @@ pub fn main() !void {
             attempt += 1;
             Metrics.inc(&m.replication_reconnections_total);
             Metrics.set(&m.replication_connected, 0);
-            const backoff = @min(
-                max_backoff_secs,
-                @as(u64, 1) << @min(attempt, 6), // 1, 2, 4, 8, 16, 32, 60
-            );
-            log.err("replication failed (attempt {d}): {}, retrying in {d}s...", .{ attempt, err, backoff });
-            std.time.sleep(backoff * @as(u64, std.time.ns_per_s));
+
+            if (isPermanentError(err)) {
+                permanent_attempt += 1;
+                Metrics.inc(&m.replication_permanent_errors_total);
+                log.err("permanent replication error (attempt {d}/{d}): {}", .{ permanent_attempt, max_permanent_retries, err });
+
+                if (permanent_attempt >= max_permanent_retries) {
+                    log.err("max retries for permanent error reached, exiting. Fix configuration and restart.", .{});
+                    std.process.exit(1);
+                }
+
+                // Short backoff for permanent errors (give operator time to see logs)
+                const backoff: u64 = @min(max_backoff_secs, @as(u64, 5) * permanent_attempt);
+                log.err("retrying in {d}s...", .{backoff});
+                std.time.sleep(backoff * @as(u64, std.time.ns_per_s));
+            } else {
+                permanent_attempt = 0; // reset on transient error
+                Metrics.inc(&m.replication_transient_errors_total);
+                const backoff = @min(
+                    max_backoff_secs,
+                    @as(u64, 1) << @min(attempt, 6), // 1, 2, 4, 8, 16, 32, 60
+                );
+                log.err("transient replication error (attempt {d}): {}, retrying in {d}s...", .{ attempt, err, backoff });
+                std.time.sleep(backoff * @as(u64, std.time.ns_per_s));
+            }
             continue;
         };
 
@@ -356,4 +397,24 @@ test {
     _ = @import("health.zig");
     _ = @import("scram.zig");
     _ = @import("metrics.zig");
+}
+
+test "isPermanentError classifies auth errors as permanent" {
+    try std.testing.expect(isPermanentError(error.AuthenticationFailed));
+    try std.testing.expect(isPermanentError(error.UnsupportedAuthMethod));
+    try std.testing.expect(isPermanentError(error.SslNotSupported));
+    try std.testing.expect(isPermanentError(error.SslCertificateError));
+    try std.testing.expect(isPermanentError(error.ServerNonceMismatch));
+    try std.testing.expect(isPermanentError(error.ServerSignatureMismatch));
+    try std.testing.expect(isPermanentError(error.Base64DecodeFailed));
+    try std.testing.expect(isPermanentError(error.WeakParameters));
+}
+
+test "isPermanentError classifies network errors as transient" {
+    try std.testing.expect(!isPermanentError(error.ConnectionRefused));
+    try std.testing.expect(!isPermanentError(error.ConnectionResetByPeer));
+    try std.testing.expect(!isPermanentError(error.BrokenPipe));
+    try std.testing.expect(!isPermanentError(error.UnexpectedEndOfData));
+    try std.testing.expect(!isPermanentError(error.ServerError));
+    try std.testing.expect(!isPermanentError(error.OutOfMemory));
 }

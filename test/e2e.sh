@@ -372,7 +372,16 @@ assert_eq "primary_key is empty for TRUNCATE" "" "$TRUNC_PK"
 echo ""
 echo "$(bold "[Test 10] Storage reconnection")"
 
-if [ "$USE_DOCKER" = true ]; then
+# Reconnection test requires Docker to restart the PG container
+DOCKER_AVAILABLE=false
+if command -v docker >/dev/null 2>&1; then
+    RECONNECT_CONTAINER=$(docker ps --format '{{.ID}} {{.Ports}}' 2>/dev/null | grep '5433->5432' | awk '{print $1}')
+    if [ -n "$RECONNECT_CONTAINER" ]; then
+        DOCKER_AVAILABLE=true
+    fi
+fi
+
+if [ "$DOCKER_AVAILABLE" = true ]; then
     # Record how many changes exist before the restart test
     RECONNECT_BEFORE=$(query "SELECT COUNT(*) FROM changes;")
 
@@ -385,8 +394,7 @@ if [ "$USE_DOCKER" = true ]; then
 
     # Restart the PostgreSQL container (source + destination are the same DB)
     log "Restarting PostgreSQL container to test storage reconnection..."
-    POSTGRES_CONTAINER=$(docker ps --format '{{.ID}} {{.Ports}}' | grep '5433->5432' | awk '{print $1}')
-    docker restart "$POSTGRES_CONTAINER" > /dev/null 2>&1
+    docker restart "$RECONNECT_CONTAINER" > /dev/null 2>&1
 
     # Wait for PostgreSQL to accept connections again
     RECONNECT_ELAPSED=0
@@ -436,7 +444,9 @@ if [ "$USE_DOCKER" = true ]; then
         fi
     fi
 else
-    echo "  SKIP: reconnection test requires Docker (use without --no-docker)"
+    echo "  $(red "FAIL") reconnection test requires Docker with PostgreSQL container on port 5433"
+    FAIL=$((FAIL + 2))
+    TOTAL=$((TOTAL + 2))
 fi
 
 # ---------------------------------------------------------------------------
@@ -583,7 +593,9 @@ if [ "$SCRAM_AVAILABLE" = true ]; then
 
     scram_cleanup
 else
-    echo "  SKIP: SCRAM PostgreSQL not available on port $SCRAM_PORT"
+    echo "  $(red "FAIL") SCRAM PostgreSQL not available on port $SCRAM_PORT"
+    FAIL=$((FAIL + 3))
+    TOTAL=$((TOTAL + 3))
 fi
 
 # ---------------------------------------------------------------------------
@@ -627,7 +639,9 @@ if [ "$SSL_AVAILABLE" = true ]; then
     # Verify SSL is enabled on the server
     SSL_ENABLED=$(ssl_query "SHOW ssl;")
     if [ "$SSL_ENABLED" != "on" ]; then
-        echo "  SKIP: SSL not enabled on PostgreSQL at port $SSL_PORT (ssl=$SSL_ENABLED)"
+        echo "  $(red "FAIL") SSL not enabled on PostgreSQL at port $SSL_PORT (ssl=$SSL_ENABLED)"
+        FAIL=$((FAIL + 7))
+        TOTAL=$((TOTAL + 7))
     else
         # Clean up any previous state
         ssl_cleanup
@@ -695,9 +709,13 @@ if [ "$SSL_AVAILABLE" = true ]; then
         SSL_CERT_DIR="/tmp/zemi-ssl-certs"
         mkdir -p "$SSL_CERT_DIR"
 
-        if [ "$USE_DOCKER" = true ]; then
-            SSL_CONTAINER=$(docker ps --format '{{.ID}} {{.Ports}}' | grep '5435->5432' | awk '{print $1}')
-            docker cp "$SSL_CONTAINER:/var/lib/postgresql/ssl/root.crt" "$SSL_CERT_DIR/root.crt" 2>/dev/null
+        # Try to extract cert via docker cp (works in CI with --no-docker too,
+        # since the SSL container is started manually in the workflow)
+        if command -v docker >/dev/null 2>&1; then
+            SSL_CONTAINER=$(docker ps --format '{{.ID}} {{.Ports}}' 2>/dev/null | grep '5435->5432' | awk '{print $1}')
+            if [ -n "$SSL_CONTAINER" ]; then
+                docker cp "$SSL_CONTAINER:/var/lib/postgresql/ssl/root.crt" "$SSL_CERT_DIR/root.crt" 2>/dev/null || true
+            fi
         fi
 
         if [ -f "$SSL_CERT_DIR/root.crt" ]; then
@@ -795,13 +813,18 @@ if [ "$SSL_AVAILABLE" = true ]; then
 
             rm -rf "$SSL_CERT_DIR"
         else
-            echo "  SKIP: Could not extract root certificate (--no-docker without cert path)"
+            echo "  $(red "FAIL") Could not extract root certificate from SSL container"
+            echo "  Ensure the postgres-ssl container is running with port 5435->5432"
+            FAIL=$((FAIL + 4))
+            TOTAL=$((TOTAL + 4))
         fi
 
         ssl_cleanup
     fi
 else
-    echo "  SKIP: SSL PostgreSQL not available on port $SSL_PORT"
+    echo "  $(red "FAIL") SSL PostgreSQL not available on port $SSL_PORT"
+    FAIL=$((FAIL + 7))
+    TOTAL=$((TOTAL + 7))
 fi
 
 # ---------------------------------------------------------------------------

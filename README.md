@@ -8,7 +8,9 @@ Zemi replaces the original Bemi's multi-runtime architecture (Java/Debezium + Go
 
 ## Benchmarks
 
-Real measurements comparing Zemi to the original Bemi:
+Real measurements comparing Zemi to the original Bemi, run automatically in CI on every push:
+
+### Resource Usage
 
 | Metric | Original Bemi | Zemi | Improvement |
 |--------|--------------|------|-------------|
@@ -19,8 +21,28 @@ Real measurements comparing Zemi to the original Bemi:
 | **Processes** | 4+ (sh, java, nats, node) | 1 | single process |
 | **Runtime deps** | JRE, Node.js, NATS, pnpm, MikroORM | 0 | zero dependencies |
 
+### Throughput (changes/sec)
+
+Measured by generating WAL changes on a source PostgreSQL and timing how long until all changes appear in the destination `changes` table. Both trackers run against identical PostgreSQL 16 service containers in CI.
+
+| Scenario | Zemi | Bemi | Speedup |
+|----------|------|------|---------|
+| **Sustained INSERTs** (10k rows) | 2,024 /s | 97 /s | **~21x** |
+| **Mixed ops** (INSERT + UPDATE + DELETE) | 1,140 /s | 98 /s | **~12x** |
+| **Large transactions** (5 x 5k rows) | 1,474 /s | 98 /s | **~15x** |
+
+### End-to-End Latency
+
+Time from a single INSERT on the source to the corresponding change appearing in the destination:
+
+| Percentile | Zemi | Bemi |
+|------------|------|------|
+| **p50** | 75 ms | 977 ms |
+| **p95** | 79 ms | 29,767 ms |
+
 ### How we measured
 
+- **Throughput**: [Automated benchmark in CI](https://github.com/deanmarano/zemi/actions/workflows/benchmark.yml) generates SQL load, then polls the destination `changes` table until all expected changes appear. Both trackers use the same test harness and identical PostgreSQL instances.
 - **Docker image size**: `docker images` after building both images on `linux/amd64`
 - **Memory**: `ps -o rss=` during active WAL replication against a live PostgreSQL instance
 - **Startup time**: `/usr/bin/time` measuring wall clock from exec to first log output (Zemi: `0.00 real`)
@@ -52,13 +74,13 @@ zig build
 DB_HOST=127.0.0.1 DB_NAME=mydb DB_USER=postgres DB_PASSWORD=secret \
   ./zig-out/bin/zemi
 
-# Run tests (42 unit tests)
+# Run tests (58 unit tests)
 zig build test
 ```
 
 ### Pre-built Binaries
 
-Download from [GitHub Releases](https://github.com/deanmarano/bemi-io/releases) for your platform:
+Download from [GitHub Releases](https://github.com/deanmarano/zemi/releases) for your platform:
 
 | Binary | Platform | Size |
 |--------|----------|------|
@@ -139,6 +161,7 @@ SSL modes:
 | `LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, `error` | `info` |
 | `TABLES` | Comma-separated list of tables to track (empty = all) | all tables |
 | `HEALTH_PORT` | TCP port for health check endpoint (empty = disabled) | disabled |
+| `METRICS_PORT` | TCP port for Prometheus metrics endpoint (empty = disabled) | disabled |
 | `SHUTDOWN_TIMEOUT` | Seconds to wait for graceful shutdown | `30` |
 | `CLEANUP_ON_SHUTDOWN` | Drop replication slot and publication on graceful shutdown (`true`/`1`/`yes`) | `false` |
 
@@ -153,6 +176,22 @@ HEALTH_PORT=4005 ./zig-out/bin/zemi
 curl http://localhost:4005/
 # Returns: HTTP 200 OK
 ```
+
+### Prometheus Metrics
+
+When `METRICS_PORT` is set, a Prometheus-compatible metrics endpoint is exposed:
+
+```bash
+METRICS_PORT=4006 ./zig-out/bin/zemi
+
+# In another terminal:
+curl http://localhost:4006/metrics
+# Returns: Prometheus text exposition format
+```
+
+Exported metrics (all prefixed with `zemi_`):
+- **Counters**: changes by operation (insert/update/delete/truncate), filtered changes, duplicate changes, transactions, WAL messages, keepalives, decode/persist errors, storage/replication reconnections
+- **Gauges**: last received/flushed LSN, replication/storage connection state, start time, replication lag bytes
 
 ## Architecture
 
@@ -194,24 +233,25 @@ Zemi reads the WAL and writes to PostgreSQL. That's it. One process, one connect
 |  | + repl   |  | + context|  | persist  |            |
 |  +----------+  +----------+  +----------+            |
 |                                                       |
-|  +----------+  +----------+  +----------+            |
-|  |connection|  |  config  |  |  health  |            |
-|  |          |  |          |  |          |            |
-|  | TCP +    |  | env vars |  | HTTP     |            |
-|  | TLS +    |  | + valid  |  | /health  |            |
-|  | auth     |  |          |  |          |            |
-|  +----------+  +----------+  +----------+            |
+|  +----------+  +----------+  +----------+  +-------+ |
+|  |connection|  |  config  |  |  health  |  |metrics| |
+|  |          |  |          |  |          |  |       | |
+|  | TCP +    |  | env vars |  | HTTP     |  | Prom  | |
+|  | TLS +    |  | + valid  |  | /health  |  | /met  | |
+|  | auth     |  |          |  |          |  |       | |
+|  +----------+  +----------+  +----------+  +-------+ |
 +-----------------------------------------------------+
 ```
 
 - **protocol.zig** -- PostgreSQL wire protocol encoding/decoding, replication messages, MD5 auth
-- **connection.zig** -- TCP connection management, startup/auth handshake (MD5 + SCRAM-SHA-256), SSL/TLS negotiation, simple query protocol
+- **connection.zig** -- TCP connection management, startup/auth handshake (MD5 + SCRAM-SHA-256), SSL/TLS negotiation, DNS hostname resolution, simple query protocol
 - **scram.zig** -- SCRAM-SHA-256 authentication (RFC 5802), PBKDF2, HMAC-SHA-256, SASL message building
 - **replication.zig** -- Logical replication stream, slot/publication management, WAL streaming
 - **decoder.zig** -- `pgoutput` logical decoding plugin parser, relation cache, context stitching
-- **storage.zig** -- Change persistence, schema migration, JSON serialization, retry logic
+- **storage.zig** -- Change persistence, schema migration, JSON serialization, retry logic, automatic reconnection
 - **config.zig** -- Environment variable parsing, validation
 - **health.zig** -- TCP health check server
+- **metrics.zig** -- Prometheus metrics collection and HTTP exposition endpoint
 - **main.zig** -- Entry point, signal handling, reconnection loop, graceful shutdown
 
 ## Building

@@ -929,14 +929,14 @@ if kill -0 "$METRICS_ZEMI_PID" 2>/dev/null; then
     done
 
     # Fetch metrics endpoint
-    METRICS_OUTPUT=$(curl -s "http://127.0.0.1:${METRICS_PORT_NUM}/metrics" 2>/dev/null || echo "")
+    METRICS_OUTPUT=$(curl -s --max-time 5 "http://127.0.0.1:${METRICS_PORT_NUM}/metrics" 2>/dev/null || echo "")
 
     assert_contains "metrics: endpoint returns zemi_changes_processed_total" "zemi_changes_processed_total" "$METRICS_OUTPUT"
     assert_contains "metrics: endpoint returns zemi_uptime_seconds" "zemi_uptime_seconds" "$METRICS_OUTPUT"
     assert_contains "metrics: endpoint returns TYPE annotations" "# TYPE zemi_changes_processed_total counter" "$METRICS_OUTPUT"
 
     # Verify non-metrics path returns 'ok'
-    HEALTH_OUTPUT=$(curl -s "http://127.0.0.1:${METRICS_PORT_NUM}/" 2>/dev/null || echo "")
+    HEALTH_OUTPUT=$(curl -s --max-time 5 "http://127.0.0.1:${METRICS_PORT_NUM}/" 2>/dev/null || echo "")
     assert_eq "metrics: non-metrics path returns ok" "ok" "$HEALTH_OUTPUT"
 else
     echo "  $(red "FAIL") Zemi failed to start for metrics endpoint test"

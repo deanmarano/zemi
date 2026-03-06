@@ -43,6 +43,7 @@ pub const ColumnValue = union(enum) {
     null_value: void,
     unchanged: void,
     text: []const u8,
+    binary: []const u8, // raw bytes, hex-encoded when duped into NamedValue
 };
 
 /// A decoded tuple (row) from pgoutput.
@@ -241,6 +242,21 @@ fn freeNamedValues(allocator: std.mem.Allocator, nvs: []NamedValue) void {
     allocator.free(nvs);
 }
 
+/// Hex-encode raw binary bytes into PostgreSQL's bytea hex format: \x followed
+/// by lowercase hex digits. Returns a heap-allocated string owned by the caller.
+fn hexEncode(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const hex_len: usize = 2 + raw.len * 2;
+    const buf = try allocator.alloc(u8, hex_len);
+    buf[0] = '\\';
+    buf[1] = 'x';
+    const charset = "0123456789abcdef";
+    for (raw, 0..) |byte, j| {
+        buf[2 + j * 2] = charset[byte >> 4];
+        buf[2 + j * 2 + 1] = charset[byte & 0x0f];
+    }
+    return buf;
+}
+
 // ============================================================================
 // Tuple Data Parsing
 // ============================================================================
@@ -274,13 +290,14 @@ fn parseTupleData(reader: *protocol.MessageReader, allocator: std.mem.Allocator)
                 }
             },
             .binary => {
-                // Binary format — read length + bytes, store as text for now
+                // Binary format — read length + raw bytes, stored as non-owning
+                // slice into the read buffer. Hex-encoded later in buildOwnedNamedValues().
                 const value_len = try reader.readInt32();
                 if (value_len < 0) {
                     columns[i] = .null_value;
                 } else {
                     const value = try reader.readBytes(@intCast(value_len));
-                    columns[i] = .{ .text = value };
+                    columns[i] = .{ .binary = value };
                 }
             },
             _ => {
@@ -1050,11 +1067,12 @@ pub const Decoder = struct {
 
             const duped_value: ColumnValue = if (excluded) switch (col_values[i]) {
                 // Replace non-null values with [EXCLUDED] sentinel
-                .text => .{ .text = try self.allocator.dupe(u8, "[EXCLUDED]") },
+                .text, .binary => .{ .text = try self.allocator.dupe(u8, "[EXCLUDED]") },
                 .null_value => .null_value, // keep NULLs as-is
                 .unchanged => .unchanged, // keep unchanged as-is
             } else switch (col_values[i]) {
                 .text => |t| .{ .text = try self.allocator.dupe(u8, t) },
+                .binary => |b| .{ .text = try hexEncode(self.allocator, b) },
                 .null_value => .null_value,
                 .unchanged => .unchanged,
             };
@@ -1085,16 +1103,22 @@ const PrimaryKeyResult = union(enum) {
 /// Extract the primary key value(s) from tuple data.
 /// For single-column PKs, returns the text value (non-owning).
 /// For composite PKs, returns all key values joined by commas (heap-allocated).
+/// Binary values are hex-encoded (heap-allocated even for single keys).
 /// Falls back to the first column if no key columns are found.
 fn extractPrimaryKey(allocator: std.mem.Allocator, col_defs: []const ColumnDef, col_values: []const ColumnValue) PrimaryKeyResult {
-    // First pass: count key columns and find their text values
+    // First pass: count key columns and find their text/binary values
     var key_count: usize = 0;
     var first_key_text: ?[]const u8 = null;
+    var first_key_binary: ?[]const u8 = null;
     for (col_defs, 0..) |col, i| {
         if (col.isKey() and i < col_values.len) {
             switch (col_values[i]) {
                 .text => |t| {
                     if (key_count == 0) first_key_text = t;
+                    key_count += 1;
+                },
+                .binary => |b| {
+                    if (key_count == 0) first_key_binary = b;
                     key_count += 1;
                 },
                 else => {
@@ -1105,8 +1129,13 @@ fn extractPrimaryKey(allocator: std.mem.Allocator, col_defs: []const ColumnDef, 
     }
 
     // Single key column — return non-owning slice (most common case)
+    // or hex-encoded for binary keys (heap-allocated)
     if (key_count == 1) {
         if (first_key_text) |t| return .{ .single = t };
+        if (first_key_binary) |b| {
+            const hex = hexEncode(allocator, b) catch return .{ .single = "" };
+            return .{ .composite = hex }; // heap-allocated, treated as composite for ownership
+        }
         return .{ .single = "" };
     }
 
@@ -1115,6 +1144,10 @@ fn extractPrimaryKey(allocator: std.mem.Allocator, col_defs: []const ColumnDef, 
         if (col_values.len > 0) {
             switch (col_values[0]) {
                 .text => |t| return .{ .single = t },
+                .binary => |b| {
+                    const hex = hexEncode(allocator, b) catch return .{ .single = "" };
+                    return .{ .composite = hex };
+                },
                 else => {},
             }
         }
@@ -1130,6 +1163,11 @@ fn extractPrimaryKey(allocator: std.mem.Allocator, col_defs: []const ColumnDef, 
             first = false;
             switch (col_values[i]) {
                 .text => |t| buf.appendSlice(t) catch return .{ .single = "" },
+                .binary => |b| {
+                    const hex = hexEncode(allocator, b) catch return .{ .single = "" };
+                    defer allocator.free(hex);
+                    buf.appendSlice(hex) catch return .{ .single = "" };
+                },
                 .null_value => buf.appendSlice("NULL") catch return .{ .single = "" },
                 .unchanged => buf.appendSlice("(unchanged)") catch return .{ .single = "" },
             }
@@ -1319,6 +1357,67 @@ test "parse Insert message" {
             }
 
             allocator.free(ins.new_tuple.columns);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "hexEncode produces PostgreSQL bytea hex format" {
+    const allocator = std.testing.allocator;
+
+    // Empty input
+    const empty = try hexEncode(allocator, "");
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("\\x", empty);
+
+    // Known bytes
+    const result = try hexEncode(allocator, &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("\\xdeadbeef", result);
+
+    // Single byte
+    const single = try hexEncode(allocator, &[_]u8{0x0A});
+    defer allocator.free(single);
+    try std.testing.expectEqualStrings("\\x0a", single);
+}
+
+test "parseTupleData handles binary column type" {
+    const allocator = std.testing.allocator;
+
+    // Build a tuple with 2 columns: text "hello" and binary 0xDEADBEEF
+    var w = protocol.MessageWriter.init(allocator);
+    defer w.deinit();
+
+    try w.writeBytes(&[_]u8{ 0x00, 0x02 }); // num_columns = 2
+    try w.writeByte('t'); // text
+    try w.writeBytes(&[_]u8{ 0x00, 0x00, 0x00, 0x05 }); // len = 5
+    try w.writeBytes("hello");
+    try w.writeByte('b'); // binary
+    try w.writeBytes(&[_]u8{ 0x00, 0x00, 0x00, 0x04 }); // len = 4
+    try w.writeBytes(&[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF });
+
+    const data = try w.toOwnedSlice();
+    defer allocator.free(data);
+    var reader = protocol.MessageReader.init(data);
+    const tuple = try parseTupleData(&reader, allocator);
+    defer allocator.free(tuple.columns);
+
+    try std.testing.expectEqual(@as(usize, 2), tuple.columns.len);
+
+    // First column: text
+    switch (tuple.columns[0]) {
+        .text => |t| try std.testing.expectEqualStrings("hello", t),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Second column: binary (raw bytes, not yet hex-encoded)
+    switch (tuple.columns[1]) {
+        .binary => |b| {
+            try std.testing.expectEqual(@as(usize, 4), b.len);
+            try std.testing.expectEqual(@as(u8, 0xDE), b[0]);
+            try std.testing.expectEqual(@as(u8, 0xAD), b[1]);
+            try std.testing.expectEqual(@as(u8, 0xBE), b[2]);
+            try std.testing.expectEqual(@as(u8, 0xEF), b[3]);
         },
         else => return error.TestUnexpectedResult,
     }

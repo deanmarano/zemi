@@ -368,6 +368,15 @@ pub const Storage = struct {
                         try appendJsonString(buf, t);
                     }
                 },
+                .binary => |b| {
+                    // Binary values should have been hex-encoded in the decoder,
+                    // but handle gracefully in case one slips through.
+                    if (!first) try buf.appendSlice(", ");
+                    first = false;
+                    try appendJsonString(buf, nv.name);
+                    try buf.appendSlice(": ");
+                    try appendJsonString(buf, b);
+                },
                 .null_value => {
                     if (!first) try buf.appendSlice(", ");
                     first = false;

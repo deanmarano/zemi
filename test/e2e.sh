@@ -63,14 +63,17 @@ cleanup() {
     drop_slot "$PSQL" "$SLOT_NAME"
     drop_slot "$PSQL" "zemi_filter_test"
     drop_slot "$PSQL" "zemi_metrics_test"
+    drop_slot "$PSQL" "zemi_schema_test"
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $PUBLICATION_NAME;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS zemi_filter_pub;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS zemi_metrics_pub;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS zemi_schema_pub;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS test_users CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS test_orders CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_tracked CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_ignored CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS metrics_test CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS schema_evo CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
     # Clean up SSL test temp files
     rm -rf /tmp/zemi-ssl-certs 2>/dev/null || true
@@ -1001,6 +1004,101 @@ else
 fi
 
 metrics_cleanup
+
+# ---------------------------------------------------------------------------
+# Test 16: Schema evolution during active replication
+# ---------------------------------------------------------------------------
+echo ""
+echo "$(bold "[Test 16] Schema evolution during active replication")"
+
+SCHEMA_SLOT="zemi_schema_test"
+SCHEMA_PUB="zemi_schema_pub"
+SCHEMA_ZEMI_PID=""
+
+schema_cleanup() {
+    if [ -n "$SCHEMA_ZEMI_PID" ] && kill -0 "$SCHEMA_ZEMI_PID" 2>/dev/null; then
+        kill "$SCHEMA_ZEMI_PID" 2>/dev/null || true
+        wait "$SCHEMA_ZEMI_PID" 2>/dev/null || true
+        sleep 1
+    fi
+    drop_slot "$PSQL" "$SCHEMA_SLOT"
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $SCHEMA_PUB;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS schema_evo CASCADE;" 2>/dev/null || true
+    PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
+}
+
+# Clean up any previous state
+schema_cleanup
+
+# Create initial table and publication
+query "CREATE TABLE schema_evo (id SERIAL PRIMARY KEY, name TEXT NOT NULL);"
+query "CREATE PUBLICATION $SCHEMA_PUB FOR TABLE schema_evo;"
+
+# Start Zemi
+SLOT_NAME="$SCHEMA_SLOT" \
+PUBLICATION_NAME="$SCHEMA_PUB" \
+"$ZEMI_BIN" > /tmp/zemi-e2e-schema.log 2>&1 &
+SCHEMA_ZEMI_PID=$!
+
+sleep 3
+
+if kill -0 "$SCHEMA_ZEMI_PID" 2>/dev/null; then
+    # --- 16a: INSERT before schema change (baseline) ---
+    query "INSERT INTO schema_evo (name) VALUES ('before-alter');"
+    wait_for_changes 1
+
+    SCHEMA_OP1=$(query "SELECT operation FROM changes WHERE after->>'name' = 'before-alter' LIMIT 1;")
+    assert_eq "schema: baseline INSERT tracked" "CREATE" "$SCHEMA_OP1"
+
+    # --- 16b: ALTER TABLE ADD COLUMN + INSERT ---
+    echo "  $(bold "16b: ADD COLUMN")"
+    query "ALTER TABLE schema_evo ADD COLUMN email TEXT;"
+    query "INSERT INTO schema_evo (name, email) VALUES ('after-add-col', 'new@example.com');"
+    wait_for_changes 2
+
+    SCHEMA_OP2=$(query "SELECT operation FROM changes WHERE after->>'name' = 'after-add-col' LIMIT 1;")
+    assert_eq "schema: INSERT after ADD COLUMN tracked" "CREATE" "$SCHEMA_OP2"
+
+    SCHEMA_EMAIL=$(query "SELECT after->>'email' FROM changes WHERE after->>'name' = 'after-add-col' LIMIT 1;")
+    assert_eq "schema: new column value captured" "new@example.com" "$SCHEMA_EMAIL"
+
+    # --- 16c: ALTER TABLE DROP COLUMN + INSERT ---
+    echo "  $(bold "16c: DROP COLUMN")"
+    query "ALTER TABLE schema_evo DROP COLUMN email;"
+    query "INSERT INTO schema_evo (name) VALUES ('after-drop-col');"
+    wait_for_changes 3
+
+    SCHEMA_OP3=$(query "SELECT operation FROM changes WHERE after->>'name' = 'after-drop-col' LIMIT 1;")
+    assert_eq "schema: INSERT after DROP COLUMN tracked" "CREATE" "$SCHEMA_OP3"
+
+    # Verify the dropped column is no longer in the after JSON
+    SCHEMA_HAS_EMAIL=$(query "SELECT after ? 'email' FROM changes WHERE after->>'name' = 'after-drop-col' LIMIT 1;")
+    assert_eq "schema: dropped column absent from after" "f" "$SCHEMA_HAS_EMAIL"
+
+    # --- 16d: ALTER TABLE ALTER COLUMN TYPE + INSERT ---
+    echo "  $(bold "16d: ALTER COLUMN TYPE")"
+    query "ALTER TABLE schema_evo ADD COLUMN score INTEGER DEFAULT 0;"
+    query "INSERT INTO schema_evo (name, score) VALUES ('before-type-change', 100);"
+    wait_for_changes 4
+
+    query "ALTER TABLE schema_evo ALTER COLUMN score TYPE NUMERIC(10,2);"
+    query "INSERT INTO schema_evo (name, score) VALUES ('after-type-change', 99.99);"
+    wait_for_changes 5
+
+    SCHEMA_OP4=$(query "SELECT operation FROM changes WHERE after->>'name' = 'after-type-change' LIMIT 1;")
+    assert_eq "schema: INSERT after ALTER COLUMN TYPE tracked" "CREATE" "$SCHEMA_OP4"
+
+    SCHEMA_SCORE=$(query "SELECT after->>'score' FROM changes WHERE after->>'name' = 'after-type-change' LIMIT 1;")
+    assert_eq "schema: altered column value captured" "99.99" "$SCHEMA_SCORE"
+else
+    echo "  $(red "FAIL") Zemi failed to start for schema evolution test"
+    echo "  --- Schema Zemi logs:"
+    cat /tmp/zemi-e2e-schema.log
+    FAIL=$((FAIL + 7))
+    TOTAL=$((TOTAL + 7))
+fi
+
+schema_cleanup
 
 # ===========================================================================
 # RESULTS

@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 const protocol = @import("protocol.zig");
+const Config = @import("config.zig").Config;
 
 const log = std.log.scoped(.decoder);
 
@@ -513,6 +514,7 @@ pub const Decoder = struct {
     allocator: std.mem.Allocator,
     relation_cache: RelationCache,
     database: []const u8,
+    config: *const Config,
 
     // Current transaction state
     current_xid: u32 = 0,
@@ -535,11 +537,12 @@ pub const Decoder = struct {
         flush: []Change,
     };
 
-    pub fn init(allocator: std.mem.Allocator, database: []const u8) Decoder {
+    pub fn init(allocator: std.mem.Allocator, database: []const u8, config: *const Config) Decoder {
         return .{
             .allocator = allocator,
             .relation_cache = RelationCache.init(allocator),
             .database = database,
+            .config = config,
             .transaction_changes = std.ArrayList(Change).init(allocator),
         };
     }
@@ -626,7 +629,7 @@ pub const Decoder = struct {
                 const lsn_str = try self.dupeFormatLsn(lsn);
                 errdefer self.allocator.free(lsn_str);
 
-                const after = try self.buildOwnedNamedValues(rel.columns, ins.new_tuple.columns);
+                const after = try self.buildOwnedNamedValues(rel.columns, ins.new_tuple.columns, rel.namespace, rel.name);
                 const pk = try self.dupeExtractPrimaryKey(rel.columns, ins.new_tuple.columns);
 
                 // Free the parsed (non-owned) tuple columns slice
@@ -657,10 +660,10 @@ pub const Decoder = struct {
                 errdefer self.allocator.free(lsn_str);
 
                 const before = if (upd.old_tuple) |old|
-                    try self.buildOwnedNamedValues(rel.columns, old.columns)
+                    try self.buildOwnedNamedValues(rel.columns, old.columns, rel.namespace, rel.name)
                 else
                     null;
-                const after = try self.buildOwnedNamedValues(rel.columns, upd.new_tuple.columns);
+                const after = try self.buildOwnedNamedValues(rel.columns, upd.new_tuple.columns, rel.namespace, rel.name);
                 const pk = try self.dupeExtractPrimaryKey(rel.columns, upd.new_tuple.columns);
 
                 // Free parsed tuple columns
@@ -690,7 +693,7 @@ pub const Decoder = struct {
                 const lsn_str = try self.dupeFormatLsn(lsn);
                 errdefer self.allocator.free(lsn_str);
 
-                const before = try self.buildOwnedNamedValues(rel.columns, del.old_tuple.columns);
+                const before = try self.buildOwnedNamedValues(rel.columns, del.old_tuple.columns, rel.namespace, rel.name);
                 const pk = try self.dupeExtractPrimaryKey(rel.columns, del.old_tuple.columns);
 
                 self.allocator.free(del.old_tuple.columns);
@@ -800,7 +803,9 @@ pub const Decoder = struct {
     }
 
     /// Build named values with owned (duped) text values.
-    fn buildOwnedNamedValues(self: *Decoder, col_defs: []const ColumnDef, col_values: []const ColumnValue) ![]NamedValue {
+    /// Excluded columns (per config) have their values replaced with "[EXCLUDED]",
+    /// unless the column is part of the primary key (key columns are never excluded).
+    fn buildOwnedNamedValues(self: *Decoder, col_defs: []const ColumnDef, col_values: []const ColumnValue, schema: []const u8, table: []const u8) ![]NamedValue {
         const count = @min(col_defs.len, col_values.len);
         var result = try self.allocator.alloc(NamedValue, count);
         var initialized: usize = 0;
@@ -816,7 +821,16 @@ pub const Decoder = struct {
         }
 
         for (0..count) |i| {
-            const duped_value: ColumnValue = switch (col_values[i]) {
+            // Check if this column should be excluded (but never exclude key columns)
+            const excluded = !col_defs[i].isKey() and
+                self.config.shouldExcludeColumn(schema, table, col_defs[i].name);
+
+            const duped_value: ColumnValue = if (excluded) switch (col_values[i]) {
+                // Replace non-null values with [EXCLUDED] sentinel
+                .text => .{ .text = try self.allocator.dupe(u8, "[EXCLUDED]") },
+                .null_value => .null_value, // keep NULLs as-is
+                .unchanged => .unchanged, // keep unchanged as-is
+            } else switch (col_values[i]) {
                 .text => |t| .{ .text = try self.allocator.dupe(u8, t) },
                 .null_value => .null_value,
                 .unchanged => .unchanged,
@@ -1309,7 +1323,8 @@ test "RelationCache put and get with owned strings" {
 
 test "Decoder full transaction: Begin, Relation, Insert, Commit" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     defer dec.deinit();
 
     // 1. Begin
@@ -1466,7 +1481,8 @@ fn buildTestCommitData() [26]u8 {
 
 test "context stitching: _bemi message stamps context on changes" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     defer dec.deinit();
 
     // 1. Begin
@@ -1513,7 +1529,8 @@ test "context stitching: _bemi message stamps context on changes" {
 
 test "context stitching: non-transactional _bemi message is ignored" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     defer dec.deinit();
 
     // 1. Begin
@@ -1554,7 +1571,8 @@ test "context stitching: non-transactional _bemi message is ignored" {
 
 test "context stitching: non-_bemi prefix is ignored" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     defer dec.deinit();
 
     const begin_data = buildTestBeginData(12);
@@ -1589,7 +1607,8 @@ test "context stitching: non-_bemi prefix is ignored" {
 
 test "context stitching: multiple changes in same transaction share context" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     defer dec.deinit();
 
     const begin_data = buildTestBeginData(13);
@@ -1635,7 +1654,8 @@ test "context stitching: multiple changes in same transaction share context" {
 
 test "Decoder full transaction: Begin, Relation, Truncate, Commit" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     defer dec.deinit();
 
     // 1. Begin
@@ -1685,7 +1705,8 @@ test "Decoder full transaction: Begin, Relation, Truncate, Commit" {
 
 test "Decoder TRUNCATE with context stitching" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     defer dec.deinit();
 
     // 1. Begin
@@ -1730,7 +1751,8 @@ test "Decoder TRUNCATE with context stitching" {
 
 test "Decoder mid-transaction flush when max_transaction_changes exceeded" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     dec.max_transaction_changes = 2; // flush after every 2 changes
     defer dec.deinit();
 
@@ -1792,7 +1814,8 @@ test "Decoder mid-transaction flush when max_transaction_changes exceeded" {
 
 test "Decoder mid-transaction flush: context only stamped on unflushed changes" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     dec.max_transaction_changes = 1; // flush after every change
     defer dec.deinit();
 
@@ -1867,7 +1890,8 @@ test "Decoder mid-transaction flush: context only stamped on unflushed changes" 
 
 test "Decoder flush with limit=0 flushes every DML immediately" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     dec.max_transaction_changes = 0; // flush after every DML
     defer dec.deinit();
 
@@ -1904,7 +1928,8 @@ test "Decoder flush with limit=0 flushes every DML immediately" {
 
 test "Decoder without max_transaction_changes never flushes mid-transaction" {
     const allocator = std.testing.allocator;
-    var dec = Decoder.init(allocator, "testdb");
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
     // max_transaction_changes defaults to null — no flushing
     defer dec.deinit();
 
@@ -1940,4 +1965,181 @@ test "Decoder without max_transaction_changes never flushes mid-transaction" {
         c.deinit(allocator);
     }
     allocator.free(changes);
+}
+
+test "column exclusion: excluded columns get [EXCLUDED] sentinel" {
+    const allocator = std.testing.allocator;
+    const test_config = Config{ .exclude_columns = "users.email" };
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    defer dec.deinit();
+
+    // 1. Begin
+    const begin_data = buildTestBeginData(50);
+    _ = try dec.decode(&begin_data, 900);
+
+    // 2. Relation (public.users: id[key], name, email)
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    // 3. Insert (id=42, name=Alice, email=null)
+    const ins = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins);
+    _ = try dec.decode(ins, 920);
+
+    // 4. Commit
+    const commit_data = buildTestCommitData();
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    const after = changes[0].after.?;
+    try std.testing.expectEqual(@as(usize, 3), after.len);
+
+    // id (key) — should NOT be excluded, value = "42"
+    try std.testing.expectEqualStrings("id", after[0].name);
+    try std.testing.expectEqualStrings("42", after[0].value.text);
+
+    // name — not in exclude list, value = "Alice"
+    try std.testing.expectEqualStrings("name", after[1].name);
+    try std.testing.expectEqualStrings("Alice", after[1].value.text);
+
+    // email — excluded, but was null so stays null
+    try std.testing.expectEqualStrings("email", after[2].name);
+    try std.testing.expect(after[2].value == .null_value);
+}
+
+test "column exclusion: excluded column with text value becomes [EXCLUDED]" {
+    const allocator = std.testing.allocator;
+    const test_config = Config{ .exclude_columns = "users.name" };
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    defer dec.deinit();
+
+    // 1. Begin
+    const begin_data = buildTestBeginData(51);
+    _ = try dec.decode(&begin_data, 900);
+
+    // 2. Relation (public.users: id[key], name, email)
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    // 3. Insert (id=42, name=Alice, email=null)
+    const ins = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins);
+    _ = try dec.decode(ins, 920);
+
+    // 4. Commit
+    const commit_data = buildTestCommitData();
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    const after = changes[0].after.?;
+
+    // id (key) — not excluded
+    try std.testing.expectEqualStrings("42", after[0].value.text);
+
+    // name — excluded, text value replaced with [EXCLUDED]
+    try std.testing.expectEqualStrings("name", after[1].name);
+    try std.testing.expectEqualStrings("[EXCLUDED]", after[1].value.text);
+
+    // email — not in exclude list, stays null
+    try std.testing.expect(after[2].value == .null_value);
+}
+
+test "column exclusion: key columns are never excluded" {
+    const allocator = std.testing.allocator;
+    // Try to exclude the key column "id" — it should be preserved
+    const test_config = Config{ .exclude_columns = "users.id,users.name" };
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    defer dec.deinit();
+
+    // 1. Begin
+    const begin_data = buildTestBeginData(52);
+    _ = try dec.decode(&begin_data, 900);
+
+    // 2. Relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    // 3. Insert
+    const ins = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins);
+    _ = try dec.decode(ins, 920);
+
+    // 4. Commit
+    const commit_data = buildTestCommitData();
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+
+    const after = changes[0].after.?;
+
+    // id is a key column — must NOT be excluded, original value preserved
+    try std.testing.expectEqualStrings("id", after[0].name);
+    try std.testing.expectEqualStrings("42", after[0].value.text);
+
+    // name is NOT a key column — should be excluded
+    try std.testing.expectEqualStrings("name", after[1].name);
+    try std.testing.expectEqualStrings("[EXCLUDED]", after[1].value.text);
+}
+
+test "column exclusion: schema-qualified exclusion" {
+    const allocator = std.testing.allocator;
+    // Only exclude name in public.users, not other schemas
+    const test_config = Config{ .exclude_columns = "public.users.name" };
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    defer dec.deinit();
+
+    const begin_data = buildTestBeginData(53);
+    _ = try dec.decode(&begin_data, 900);
+
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    const ins = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins);
+    _ = try dec.decode(ins, 920);
+
+    const commit_data = buildTestCommitData();
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+
+    const after = changes[0].after.?;
+
+    // name excluded via schema-qualified match (public.users.name)
+    try std.testing.expectEqualStrings("[EXCLUDED]", after[1].value.text);
+
+    // id still preserved (key column)
+    try std.testing.expectEqualStrings("42", after[0].value.text);
 }

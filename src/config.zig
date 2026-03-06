@@ -92,6 +92,13 @@ pub const Config = struct {
     // rely on all values being JSON strings.
     json_type_coercion: bool = false,
 
+    // Column exclusion: comma-separated list of columns to exclude from
+    // change tracking. Format: "table.column" or "schema.table.column".
+    // Excluded columns have their values replaced with "[EXCLUDED]" in
+    // before/after JSONB. Primary key columns are never excluded.
+    // null = no exclusions (default).
+    exclude_columns: ?[]const u8 = null,
+
     /// Returns the effective destination host (falls back to source).
     pub fn getDestHost(self: Config) []const u8 {
         return self.dest_db_host orelse self.db_host;
@@ -128,6 +135,79 @@ pub const Config = struct {
             }
         }
         return false;
+    }
+
+    /// Check if a column should be excluded from change tracking.
+    /// Matches against EXCLUDE_COLUMNS entries in these formats:
+    ///   - "table.column" — matches column in any schema of that table
+    ///   - "schema.table.column" — matches only in the specific schema
+    /// Returns true if the column should be excluded.
+    pub fn shouldExcludeColumn(self: Config, schema: []const u8, table: []const u8, column: []const u8) bool {
+        const exclude_str = self.exclude_columns orelse return false;
+        var iter = std.mem.splitScalar(u8, exclude_str, ',');
+        while (iter.next()) |entry| {
+            const trimmed = std.mem.trim(u8, entry, " \t");
+            if (trimmed.len == 0) continue;
+
+            // Try schema.table.column (3 parts)
+            if (parseExcludeEntry(trimmed)) |parsed| {
+                if (parsed.schema) |s| {
+                    // 3-part match: schema.table.column
+                    if (std.mem.eql(u8, s, schema) and
+                        std.mem.eql(u8, parsed.table, table) and
+                        std.mem.eql(u8, parsed.column, column))
+                    {
+                        return true;
+                    }
+                } else {
+                    // 2-part match: table.column
+                    if (std.mem.eql(u8, parsed.table, table) and
+                        std.mem.eql(u8, parsed.column, column))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    const ExcludeEntry = struct {
+        schema: ?[]const u8,
+        table: []const u8,
+        column: []const u8,
+    };
+
+    /// Parse a single EXCLUDE_COLUMNS entry into its component parts.
+    /// Supports "table.column" and "schema.table.column" formats.
+    fn parseExcludeEntry(entry: []const u8) ?ExcludeEntry {
+        // Count dots to determine format
+        var dot_count: usize = 0;
+        var first_dot: usize = 0;
+        var second_dot: usize = 0;
+        for (entry, 0..) |c, i| {
+            if (c == '.') {
+                dot_count += 1;
+                if (dot_count == 1) first_dot = i;
+                if (dot_count == 2) second_dot = i;
+            }
+        }
+
+        if (dot_count == 1) {
+            // table.column
+            const tbl = entry[0..first_dot];
+            const col = entry[first_dot + 1 ..];
+            if (tbl.len == 0 or col.len == 0) return null;
+            return .{ .schema = null, .table = tbl, .column = col };
+        } else if (dot_count == 2) {
+            // schema.table.column
+            const sch = entry[0..first_dot];
+            const tbl = entry[first_dot + 1 .. second_dot];
+            const col = entry[second_dot + 1 ..];
+            if (sch.len == 0 or tbl.len == 0 or col.len == 0) return null;
+            return .{ .schema = sch, .table = tbl, .column = col };
+        }
+        return null; // invalid format
     }
 
     pub fn fromEnv() Config {
@@ -256,6 +336,10 @@ pub const Config = struct {
             }
         }
 
+        if (std.posix.getenv("EXCLUDE_COLUMNS")) |v| {
+            if (v.len > 0) config.exclude_columns = v;
+        }
+
         return config;
     }
 
@@ -273,6 +357,10 @@ pub const Config = struct {
         // Validate table names if TABLES is set (these go into SQL statements)
         if (self.tables) |tables_str| {
             if (validateTableNames(tables_str)) |err_msg| return err_msg;
+        }
+        // Validate EXCLUDE_COLUMNS entries
+        if (self.exclude_columns) |exclude_str| {
+            if (validateExcludeColumns(exclude_str)) |err_msg| return err_msg;
         }
         return null;
     }
@@ -311,6 +399,34 @@ pub const Config = struct {
                 if (!isValidIdentifier(trimmed)) {
                     return "TABLES contains an invalid table name (must be valid SQL identifiers, e.g. 'users' or 'public.users')";
                 }
+            }
+        }
+        return null;
+    }
+
+    /// Validate all entries in EXCLUDE_COLUMNS.
+    /// Each entry must be "table.column" or "schema.table.column" where
+    /// all parts are valid SQL identifiers.
+    fn validateExcludeColumns(exclude_str: []const u8) ?[]const u8 {
+        var iter = std.mem.splitScalar(u8, exclude_str, ',');
+        while (iter.next()) |entry| {
+            const trimmed = std.mem.trim(u8, entry, " \t");
+            if (trimmed.len == 0) continue;
+
+            const parsed = parseExcludeEntry(trimmed) orelse {
+                return "EXCLUDE_COLUMNS entry must be 'table.column' or 'schema.table.column'";
+            };
+
+            if (parsed.schema) |s| {
+                if (!isValidIdentifier(s)) {
+                    return "EXCLUDE_COLUMNS contains an invalid schema name";
+                }
+            }
+            if (!isValidIdentifier(parsed.table)) {
+                return "EXCLUDE_COLUMNS contains an invalid table name";
+            }
+            if (!isValidIdentifier(parsed.column)) {
+                return "EXCLUDE_COLUMNS contains an invalid column name";
             }
         }
         return null;
@@ -366,6 +482,9 @@ pub const Config = struct {
         }
         if (self.json_type_coercion) {
             log.info("config: json_type_coercion=true", .{});
+        }
+        if (self.exclude_columns) |ec| {
+            log.info("config: exclude_columns={s}", .{ec});
         }
         if (self.health_port) |port| {
             log.info("config: health_port={d}", .{port});
@@ -538,4 +657,56 @@ test "max_transaction_changes can be set explicitly" {
 test "validate accepts config with max_transaction_changes set" {
     const config = Config{ .max_transaction_changes = 100 };
     try std.testing.expect(config.validate() == null);
+}
+
+test "shouldExcludeColumn with no filter excludes nothing" {
+    const config = Config{};
+    try std.testing.expect(!config.shouldExcludeColumn("public", "users", "ssn"));
+    try std.testing.expect(!config.shouldExcludeColumn("public", "users", "name"));
+}
+
+test "shouldExcludeColumn matches table.column format" {
+    const config = Config{ .exclude_columns = "users.ssn, users.password" };
+    try std.testing.expect(config.shouldExcludeColumn("public", "users", "ssn"));
+    try std.testing.expect(config.shouldExcludeColumn("public", "users", "password"));
+    try std.testing.expect(config.shouldExcludeColumn("other_schema", "users", "ssn"));
+    try std.testing.expect(!config.shouldExcludeColumn("public", "users", "name"));
+    try std.testing.expect(!config.shouldExcludeColumn("public", "orders", "ssn"));
+}
+
+test "shouldExcludeColumn matches schema.table.column format" {
+    const config = Config{ .exclude_columns = "public.users.ssn, private.accounts.balance" };
+    try std.testing.expect(config.shouldExcludeColumn("public", "users", "ssn"));
+    try std.testing.expect(!config.shouldExcludeColumn("other", "users", "ssn"));
+    try std.testing.expect(config.shouldExcludeColumn("private", "accounts", "balance"));
+    try std.testing.expect(!config.shouldExcludeColumn("public", "accounts", "balance"));
+}
+
+test "shouldExcludeColumn handles mixed formats" {
+    const config = Config{ .exclude_columns = "users.ssn, public.accounts.secret" };
+    // table.column matches any schema
+    try std.testing.expect(config.shouldExcludeColumn("public", "users", "ssn"));
+    try std.testing.expect(config.shouldExcludeColumn("private", "users", "ssn"));
+    // schema.table.column only matches specific schema
+    try std.testing.expect(config.shouldExcludeColumn("public", "accounts", "secret"));
+    try std.testing.expect(!config.shouldExcludeColumn("private", "accounts", "secret"));
+}
+
+test "validate rejects invalid EXCLUDE_COLUMNS entries" {
+    {
+        const config = Config{ .exclude_columns = "just_a_column" };
+        try std.testing.expect(config.validate() != null);
+    }
+    {
+        const config = Config{ .exclude_columns = "users.ssn; DROP TABLE foo" };
+        try std.testing.expect(config.validate() != null);
+    }
+    {
+        const config = Config{ .exclude_columns = "users.ssn,orders.total" };
+        try std.testing.expect(config.validate() == null);
+    }
+    {
+        const config = Config{ .exclude_columns = "public.users.ssn" };
+        try std.testing.expect(config.validate() == null);
+    }
 }

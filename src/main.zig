@@ -264,7 +264,7 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
     stream.startKeepaliveThread(10);
 
     // Step 7: Initialize the pgoutput decoder
-    var dec = decoder.Decoder.init(allocator, config.db_name);
+    var dec = decoder.Decoder.init(allocator, config.db_name, &config);
     dec.max_transaction_changes = config.max_transaction_changes;
     defer dec.deinit();
 

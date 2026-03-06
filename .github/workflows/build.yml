@@ -170,8 +170,7 @@ jobs:
             -c password_encryption=md5 \
             -c ssl=on \
             -c ssl_cert_file=/var/lib/postgresql/ssl/server.crt \
-            -c ssl_key_file=/var/lib/postgresql/ssl/server.key \
-            -c ssl_ca_file=/var/lib/postgresql/ssl/ca.crt
+            -c ssl_key_file=/var/lib/postgresql/ssl/server.key
 
           # Wait for SSL PostgreSQL to be ready
           for i in $(seq 1 30); do

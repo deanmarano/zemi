@@ -757,8 +757,9 @@ if [ "$SSL_AVAILABLE" = true ]; then
             ssl_query "DELETE FROM ssl_test_items;" 2>/dev/null || true
 
             # verify-full checks that the server certificate hostname matches DB_HOST.
-            # Our test cert has SAN IP:127.0.0.1, so we connect via 127.0.0.1.
-            DB_HOST="127.0.0.1" \
+            # Our test cert has SAN DNS:localhost — Zig's TLS verifies DNS SANs
+            # but not IP SANs, so we connect via localhost instead of 127.0.0.1.
+            DB_HOST="localhost" \
             DB_PORT="$SSL_PORT" \
             DB_SSL_MODE="verify-full" \
             DB_SSL_ROOT_CERT="$SSL_CERT_DIR/root.crt" \

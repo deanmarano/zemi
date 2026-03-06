@@ -1,13 +1,12 @@
 ---
-title: Bemi and Self-Managed Integration - Audit Trail and Data Tracking
+title: Self-Managed PostgreSQL - Setup for Zemi
 sidebar_label: Self-Managed
 hide_title: true
-description: Learn how to configure your self-managed database with Bemi for real-time data tracking using Change Data Capture (CDC). Includes detailed setup instructions for connections and WAL levels.
-keywords: [Bemi, Self-Managed, PostgreSQL, Change Data Capture, real-time data tracking, audit trail, WAL, logical replication]
-image: 'img/social-card.png'
+description: How to configure a self-managed PostgreSQL database for Zemi change tracking using logical replication.
+keywords: [Zemi, Self-Managed, PostgreSQL, Change Data Capture, logical replication, WAL]
 ---
 
-# Self-managed PostgreSQL
+# Self-Managed PostgreSQL
 
 ## WAL level
 
@@ -17,7 +16,44 @@ Run the following SQL command to change the WAL level from `replica` to `logical
 ALTER SYSTEM SET wal_level = logical;
 ```
 
-If you have issues in other PostgreSQL hosting environments, please [contact us](https://bemi.io/contact-us), and we will send you detailed instructions on how to set it up.
+## Connection
+
+Use the same database credentials you normally use to connect to PostgreSQL from your application.
+
+## Read-only credentials
+
+For production use, you can create a dedicated read-only user with replication permission:
+
+```sql
+-- Create read-only user with REPLICATION permission
+CREATE ROLE [username] WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE REPLICATION PASSWORD '[password]';
+-- Grant SELECT access to tables for selective tracking
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO [username];
+-- Grant SELECT access to new tables created in the future
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO [username];
+```
+
+To track "before" state on changes, set REPLICA IDENTITY FULL:
+
+```sql
+-- Set REPLICA IDENTITY FULL for tables you want to track
+ALTER TABLE [table_name] REPLICA IDENTITY FULL;
+```
+
+Or apply it to all tables:
+
+```sql
+CREATE OR REPLACE PROCEDURE set_replica_identity_full() AS $$ DECLARE current_tablename TEXT;
+BEGIN
+  FOR current_tablename IN SELECT tablename FROM pg_tables LEFT JOIN pg_class ON relname = tablename WHERE schemaname = 'public' AND relkind != 'f' AND relreplident != 'f' LOOP
+    EXECUTE format('ALTER TABLE %I REPLICA IDENTITY FULL', current_tablename);
+  END LOOP;
+END $$ LANGUAGE plpgsql;
+
+CALL set_replica_identity_full();
+```
+
+If you have issues in other PostgreSQL hosting environments, please [open an issue](https://github.com/deanmarano/zemi/issues) and we will help you set it up.
 
 ## Connection
 

@@ -129,6 +129,7 @@ The `changes` table is always excluded from tracking to prevent recursive WAL ev
 |----------|-------------|---------|
 | `LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, `error` | `info` |
 | `HEALTH_PORT` | TCP port for health check endpoint | disabled |
+| `METRICS_PORT` | TCP port for Prometheus metrics endpoint | disabled |
 | `SHUTDOWN_TIMEOUT` | Seconds to wait for graceful shutdown | `30` |
 | `CLEANUP_ON_SHUTDOWN` | Drop replication slot and publication on graceful shutdown | `false` |
 
@@ -152,6 +153,40 @@ curl -s http://localhost:4005/
 ```
 
 This is useful for Docker `HEALTHCHECK`, Kubernetes liveness probes, or load balancer health checks.
+
+### Prometheus Metrics
+
+When `METRICS_PORT` is set, Zemi starts an HTTP server that exposes Prometheus-compatible metrics at `/metrics`:
+
+```bash
+METRICS_PORT=4006 ./zig-out/bin/zemi
+
+# Test:
+curl -s http://localhost:4006/metrics
+# Returns: Prometheus text exposition format (v0.0.4)
+```
+
+All metric names are prefixed with `zemi_`. Exported metrics:
+
+**Counters:**
+- `zemi_changes_total{operation="insert|update|delete|truncate"}` — changes tracked by operation type
+- `zemi_changes_filtered_total` — changes skipped by table filter
+- `zemi_changes_duplicated_total` — duplicate changes (ON CONFLICT DO NOTHING)
+- `zemi_transactions_total` — transactions processed
+- `zemi_wal_messages_received_total` — WAL messages received from PostgreSQL
+- `zemi_keepalives_received_total` — keepalive messages received
+- `zemi_decode_errors_total` — pgoutput decoding errors
+- `zemi_persist_errors_total` — change persistence errors
+- `zemi_storage_reconnections_total` — storage connection reconnections
+- `zemi_replication_reconnections_total` — replication connection reconnections
+
+**Gauges:**
+- `zemi_last_received_lsn` — last WAL position received
+- `zemi_last_flushed_lsn` — last WAL position flushed to storage
+- `zemi_replication_connected` — replication connection state (0 or 1)
+- `zemi_storage_connected` — storage connection state (0 or 1)
+- `zemi_start_time_seconds` — process start time (Unix timestamp)
+- `zemi_replication_lag_bytes` — replication lag in bytes (received - flushed)
 
 ### Graceful Shutdown
 
@@ -204,6 +239,7 @@ PUBLICATION_NAME=zemi_prod \
 TABLES=users,orders,payments \
 LOG_LEVEL=info \
 HEALTH_PORT=4005 \
+METRICS_PORT=4006 \
 SHUTDOWN_TIMEOUT=60 \
 CLEANUP_ON_SHUTDOWN=false \
 ./zig-out/bin/zemi
@@ -220,7 +256,9 @@ docker run --rm \
   -e DB_PASSWORD=secret \
   -e DB_SSL_MODE=require \
   -e HEALTH_PORT=4005 \
+  -e METRICS_PORT=4006 \
   -e TABLES=users,orders \
   -p 4005:4005 \
+  -p 4006:4006 \
   ghcr.io/deanmarano/zemi:latest
 ```

@@ -1,10 +1,9 @@
 ---
-title: Bemi and AWS RDS Integration - Audit Trail and Data Tracking
+title: AWS RDS - PostgreSQL Setup for Zemi
 sidebar_label: AWS RDS
 hide_title: true
-description: Learn how to configure your AWS RDS database with Bemi for real-time data tracking using Change Data Capture (CDC). Includes detailed setup instructions for connections and WAL levels.
-keywords: [Bemi, AWS RDS, PostgreSQL, Change Data Capture, real-time data tracking, audit trail, WAL, logical replication]
-image: 'img/social-card.png'
+description: How to configure your AWS RDS PostgreSQL database for Zemi change tracking using logical replication.
+keywords: [Zemi, AWS RDS, PostgreSQL, Change Data Capture, logical replication, WAL]
 ---
 
 # Amazon Web Services RDS

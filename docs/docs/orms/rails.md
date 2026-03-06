@@ -120,32 +120,13 @@ psql postgres://postgres:postgres@127.0.0.1:5432/[YOUR_DATABASE] -c \
  27          | todo  | DELETE    | {"id": 27, "task": "Eat", "is_completed": false}   | {}                                                  | {"user_id": 187234, "endpoint": "/todo/27", "method": "DELETE", "SQL": "DELETE FROM ..."} | 2023-12-11 17:09:18+00
 ```
 
-### Remote database
+### Destination database
 
-Go to Bemi.io [Dashboard UI](https://dashboard.bemi.io/log-in?ref=rails) and follow the instructions to connect your hosted PostgreSQL database in a few seconds.
-
-![dashboard](/img/dashboard.png)
-
-Once the project infrastructure is provisioned, it'll automatically ingest and store all data changes stitched with an application context in a separate serverless PostgreSQL database. You can test the connection by running the following command:
-
-```
-psql postgres://[USERNAME]@[HOSTNAME]:5432/[DATABASE] -c \
-  'SELECT "primary_key", "table", "operation", "before", "after", "context", "committed_at" FROM changes;'
-
- primary_key | table | operation |                       before                       |                       after                         |                        context                                                            |      committed_at
--------------+-------+-----------+----------------------------------------------------+-----------------------------------------------------+-------------------------------------------------------------------------------------------+------------------------
- 26          | todo  | CREATE    | {}                                                 | {"id": 26, "task": "Sleep", "is_completed": false}  | {"user_id": 187234, "endpoint": "/todo", "method": "POST", "SQL": "INSERT INTO ..."}      | 2023-12-11 17:09:09+00
- 27          | todo  | CREATE    | {}                                                 | {"id": 27, "task": "Eat", "is_completed": false}    | {"user_id": 187234, "endpoint": "/todo", "method": "POST", "SQL": "INSERT INTO ..."}      | 2023-12-11 17:09:11+00
- 28          | todo  | CREATE    | {}                                                 | {"id": 28, "task": "Repeat", "is_completed": false} | {"user_id": 187234, "endpoint": "/todo", "method": "POST", "SQL": "INSERT INTO ..."}      | 2023-12-11 17:09:13+00
- 26          | todo  | UPDATE    | {"id": 26, "task": "Sleep", "is_completed": false} | {"id": 26, "task": "Sleep", "is_completed": true}   | {"user_id": 187234, "endpoint": "/todo/complete", "method": "PUT", "SQL": "UPDATE ..."}   | 2023-12-11 17:09:15+00
- 27          | todo  | DELETE    | {"id": 27, "task": "Eat", "is_completed": false}   | {}                                                  | {"user_id": 187234, "endpoint": "/todo/27", "method": "DELETE", "SQL": "DELETE FROM ..."} | 2023-12-11 17:09:18+00
-```
-
-See [Destination Database](/postgresql/destination-database) for more details.
+If you configured Zemi with a separate destination database (via `DEST_DB_*` environment variables), changes are stored there. Otherwise, changes are stored in the same database as the source. See the [Zemi Configuration](../zemi/configuration) for details.
 
 ## Data change querying
 
-Lastly, connect to the Bemi PostgreSQL destination database to easily query change data from your application.
+Connect to the database where Zemi stores changes to query change data from your application.
 
 To query historical data, configure an additional [database connection with Active Record](https://guides.rubyonrails.org/active_record_multiple_databases.html):
 

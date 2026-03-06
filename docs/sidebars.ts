@@ -1,29 +1,22 @@
 import type { SidebarsConfig } from "@docusaurus/plugin-content-docs";
 
-/**
- * Creating a sidebar enables you to:
- - create an ordered group of docs
- - render a sidebar for each doc of that group
- - provide next/previous navigation
-
- The sidebars can be generated from the filesystem, or explicitly defined here.
-
- Create as many sidebars as you want.
- */
 const sidebars: SidebarsConfig = {
-  bemiSidebar: [
+  zemiSidebar: [
     'home',
-    'faq',
+    'zemi/overview',
+    'zemi/benchmarks',
+    'zemi/architecture',
+    'zemi/configuration',
     {
       type: 'category',
-      label: 'PostgreSQL',
+      label: 'PostgreSQL Setup',
       collapsed: false,
       items: [
         'postgresql/source-database',
         {
           type: 'category',
           label: 'Hosting Platforms',
-          collapsed: false,
+          collapsed: true,
           items: [
             'hosting/supabase',
             'hosting/neon',
@@ -34,12 +27,51 @@ const sidebars: SidebarsConfig = {
             'hosting/self-managed',
           ],
         },
-        'postgresql/destination-database',
       ],
     },
     {
       type: 'category',
-      label: 'ORMs',
+      label: 'ORM Packages',
+      collapsed: true,
+      items: [
+        {
+          type: 'category',
+          label: 'JavaScript/TypeScript',
+          collapsed: true,
+          items: [
+            'orms/prisma',
+            'orms/drizzle',
+            'orms/typeorm',
+            'orms/supabase-js',
+            'orms/mikro-orm',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Ruby',
+          collapsed: true,
+          items: [
+            'orms/rails',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Python',
+          collapsed: true,
+          items: [
+            'orms/sqlalchemy',
+            'orms/django',
+          ],
+        },
+      ],
+    },
+    'alternatives',
+    'zemi/migration',
+  ],
+  bemiSidebar: [
+    {
+      type: 'category',
+      label: 'ORM Packages',
       collapsed: false,
       items: [
         {
@@ -73,16 +105,6 @@ const sidebars: SidebarsConfig = {
         },
       ],
     },
-    'alternatives',
-    'self-hosting',
-    'changelog',
-  ],
-  zemiSidebar: [
-    'zemi/overview',
-    'zemi/benchmarks',
-    'zemi/architecture',
-    'zemi/configuration',
-    'zemi/migration',
   ],
 };
 

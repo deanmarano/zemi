@@ -106,8 +106,8 @@ Zemi has zero runtime dependencies. Copy the binary to any Linux machine and run
 | Docker image | 3.23 GB | 1.04 MB | 3,100x |
 | Memory | 300–500 MB | 2.8 MB | ~150x |
 | Startup | 30–60 s | &lt;1 ms | &gt;30,000x |
-| Throughput | ~90 changes/s | ~10,000 changes/s | ~100x |
-| Latency (p50) | ~9,000 ms | ~115 ms | ~80x |
+| Throughput | ~97 changes/s | ~2,000 changes/s | ~20x |
+| Latency (p50) | ~977 ms | ~75 ms | ~13x |
 | Processes | 4+ | 1 | 4x |
 | Dependencies | 7+ | 0 | -- |
 

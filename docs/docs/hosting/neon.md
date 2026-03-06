@@ -1,10 +1,9 @@
 ---
-title: Bemi and Neon Integration - Audit Trail and Data Tracking
+title: Neon - PostgreSQL Setup for Zemi
 sidebar_label: Neon
 hide_title: true
-description: Learn how to configure your Neon database with Bemi for real-time data tracking using Change Data Capture (CDC). Includes detailed setup instructions for connections and WAL levels.
-keywords: [Bemi, Neon, PostgreSQL, Change Data Capture, real-time data tracking, audit trail, WAL, logical replication]
-image: 'img/social-card.png'
+description: How to configure your Neon PostgreSQL database for Zemi change tracking using logical replication.
+keywords: [Zemi, Neon, PostgreSQL, Change Data Capture, logical replication, WAL]
 ---
 
 # Neon
@@ -16,19 +15,15 @@ To enable logical replication in [Neon](https://neon.tech/):
 1. Select your project in the Neon Console.
 2. On the Neon **Dashboard**, select **Settings**.
 3. Select **Beta**.
-4. Click **Enable** to enable logical replication. This will set the Postgres `wal_level` setting to `logical`.
+4. Click **Enable** to enable logical replication. This will set `wal_level` to `logical`.
 
 ## Connection
 
-To connect a [Neon](https://neon.tech/docs/guides/bemi) Postgres database, specify your database credentials, which can be found on your Neon project's dashboard:
+Specify your database credentials from your Neon project's dashboard.
 
-**Note:** Please use the `Host` name without enabling the "Pooled connection" option.
+**Note:** Use the `Host` name without enabling the "Pooled connection" option.
 
 ![](/img/perm-neon.png)
-
-And that's it, everything should just work!
-
-For a detailed setup guide, see [Create an automatic audit trail with Bemi and Neon](https://neon.tech/docs/guides/bemi), in the _Neon documentation_.
 
 ## Read-only credentials
 

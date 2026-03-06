@@ -18,11 +18,12 @@ Below is a summary that compares the alternatives:
 * Change Data Capture ([debezium](https://debezium.io/) written in Java, [pgcapture](https://github.com/replicase/pgcapture) written in Go, etc.)
 * [PgAudit](https://www.pgaudit.org/) extension
 
-|                                   | [Bemi Cloud](https://bemi.io/) | PG Triggers | App Tracking | Change Data Capture | PgAudit Logs |
-|-----------------------------------|--------------------------------|--------------|-------------|---------------------|--------------|
-| PostgreSQL data change tracking   | ✅                             | ✅           | ✅          | ✅                  | ❌           |
-| SQL commands tracking             | ✅                             | ✅           | ❌          | ❌                  | ✅           |
-| Reliable tracking accuracy        | ✅                             | ✅           | ❌          | ✅                  | ✅           |
-| No runtime performance impact     | ✅                             | ❌           | ❌          | ✅                  | ✅           |
-| Separate scalable storage         | ✅                             | ❌           | ❌          | ✅                  | ❌           |
-| App context (user, API req, etc.) | ✅                             | ❌           | ✅          | ❌                  | ❌           |
+|                                   | [Zemi](https://github.com/deanmarano/zemi) | PG Triggers | App Tracking | Change Data Capture | PgAudit Logs |
+|-----------------------------------|---------------------------------------------|-------------|--------------|---------------------|--------------|
+| PostgreSQL data change tracking   | ✅                                          | ✅          | ✅           | ✅                  | ❌           |
+| SQL commands tracking             | ❌                                          | ✅          | ❌           | ❌                  | ✅           |
+| Reliable tracking accuracy        | ✅                                          | ✅          | ❌           | ✅                  | ✅           |
+| No runtime performance impact     | ✅                                          | ❌          | ❌           | ✅                  | ✅           |
+| Separate scalable storage         | ✅                                          | ❌          | ❌           | ✅                  | ❌           |
+| App context (user, API req, etc.) | ✅                                          | ❌          | ✅           | ❌                  | ❌           |
+| Single binary, no JVM/runtime     | ✅                                          | N/A         | N/A          | ❌                  | N/A          |

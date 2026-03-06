@@ -53,29 +53,29 @@ const config: Config = {
 
   themeConfig: {
     metadata: [
-      {name: 'title', content: 'Bemi Docs - Automatic Audit Trail as a Service for PostgreSQL'},
-      {name: 'description', content: 'Bemi: Your automatic, reliable audit trail for PostgreSQL. Securely connect to your databases, enrich data changes, and maintain an immutable record of data modifications with military-grade encryption. Perfect for troubleshooting, reporting, data recovery, and audit purposes'},
-      {name: 'keywords', content: 'Bemi, PostgreSQL audit trail, database tracking, data compliance, PostgreSQL data changes, automated audit, change data capture, data observability, pgaudit'},
+      {name: 'title', content: 'Zemi Docs - Automatic PostgreSQL Change Tracking'},
+      {name: 'description', content: 'Zemi: Automatic, reliable PostgreSQL change tracking via WAL replication. A single static binary that captures every INSERT, UPDATE, DELETE, and TRUNCATE with context-aware audit trails.'},
+      {name: 'keywords', content: 'Zemi, PostgreSQL audit trail, database tracking, change data capture, WAL replication, logical replication, pgoutput, Zig'},
       {name: 'image', content: 'img/social-card.png'},
     ],
     image: "img/social-card.png",
     navbar: {
-      title: "Bemi",
+      title: "Zemi",
       logo: {
-        alt: "Bemi Logo",
+        alt: "Zemi Logo",
         src: "img/logo.png",
       },
       items: [
         {
           type: "docSidebar",
-          sidebarId: "bemiSidebar",
-          label: "Bemi",
+          sidebarId: "zemiSidebar",
+          label: "Docs",
           position: "left",
         },
         {
           type: "docSidebar",
-          sidebarId: "zemiSidebar",
-          label: "Zemi",
+          sidebarId: "bemiSidebar",
+          label: "Bemi ORM Packages",
           position: "left",
         },
         {
@@ -89,24 +89,32 @@ const config: Config = {
       style: "dark",
       links: [
         {
-          title: "Bemi",
+          title: "Zemi",
           items: [
             {
-              label: "Homepage",
-              href: "https://bemi.io",
+              label: "Overview",
+              href: "/zemi/zemi",
             },
             {
-              label: "Blog",
-              href: "https://bemi.io/blog",
+              label: "Benchmarks",
+              href: "/zemi/zemi/benchmarks",
             },
             {
-              label: "Contact us",
-              href: "https://bemi.io/contact-us",
+              label: "Architecture",
+              href: "/zemi/zemi/architecture",
+            },
+            {
+              label: "Configuration",
+              href: "/zemi/zemi/configuration",
+            },
+            {
+              label: "Migration Guide",
+              href: "/zemi/zemi/migration",
             },
           ],
         },
         {
-          title: "Bemi packages",
+          title: "ORM Packages",
           items: [
             {
               label: "Prisma",
@@ -151,46 +159,8 @@ const config: Config = {
             },
           ],
         },
-        {
-          title: "Zemi",
-          items: [
-            {
-              label: "Overview",
-              href: "/zemi/zemi",
-            },
-            {
-              label: "Benchmarks",
-              href: "/zemi/zemi/benchmarks",
-            },
-            {
-              label: "Architecture",
-              href: "/zemi/zemi/architecture",
-            },
-            {
-              label: "Configuration",
-              href: "/zemi/zemi/configuration",
-            },
-            {
-              label: "Migration Guide",
-              href: "/zemi/zemi/migration",
-            },
-          ],
-        },
-        {
-          title: "Socials",
-          items: [
-            {
-              label: "LinkedIn",
-              href: "https://www.linkedin.com/company/bemihq/about",
-            },
-            {
-              label: "Twitter",
-              href: "https://twitter.com/BemiHQ",
-            },
-          ],
-        },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} Bemi`,
+      copyright: `Copyright © ${new Date().getFullYear()} Zemi`,
     },
     prism: {
       theme: prismThemes.github,

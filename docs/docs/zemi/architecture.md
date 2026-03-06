@@ -43,14 +43,14 @@ One process. One connection in (replication), one connection out (persistence). 
 │  │ + repl   │  │ + context│  │ persist  │           │
 │  └──────────┘  └──────────┘  └──────────┘           │
 │                                                       │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐           │
-│  │connection│  │  config  │  │  health  │           │
-│  │          │  │          │  │          │           │
-│  │ TCP +    │  │ env vars │  │ HTTP     │           │
-│  │ TLS +    │  │ + valid  │  │ /health  │           │
-│  │ auth     │  │          │  │          │           │
-│  └──────────┘  └──────────┘  └──────────┘           │
-└─────────────────────────────────────────────────────┘
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌───────┐ │
+│  │connection│  │  config  │  │  health  │  │metrics│ │
+│  │          │  │          │  │          │  │       │ │
+│  │ TCP +    │  │ env vars │  │ HTTP     │  │ Prom  │ │
+│  │ TLS +    │  │ + valid  │  │ /health  │  │ /met  │ │
+│  │ auth     │  │          │  │          │  │       │ │
+│  └──────────┘  └──────────┘  └──────────┘  └───────┘ │
+└───────────────────────────────────────────────────────┘
 ```
 
 ### Source Files
@@ -58,16 +58,17 @@ One process. One connection in (replication), one connection out (persistence). 
 | File | Purpose |
 |------|---------|
 | `src/protocol.zig` | PostgreSQL wire protocol encoding/decoding, replication messages, MD5 authentication (10 tests) |
-| `src/connection.zig` | TCP connection management, SSL/TLS negotiation, startup/auth handshake (MD5 + SCRAM-SHA-256), simple query protocol |
+| `src/connection.zig` | TCP connection management, SSL/TLS negotiation, DNS hostname resolution, startup/auth handshake (MD5 + SCRAM-SHA-256), simple query protocol |
 | `src/scram.zig` | SCRAM-SHA-256 authentication (RFC 5802), PBKDF2, HMAC-SHA-256, SASL messages (5 tests) |
 | `src/replication.zig` | Logical replication stream, slot/publication management, WAL streaming |
-| `src/decoder.zig` | `pgoutput` logical decoding plugin parser, relation cache, context stitching (18 tests) |
-| `src/storage.zig` | Change persistence, schema migration, JSON serialization, retry logic (10 tests) |
-| `src/config.zig` | Environment variable parsing, validation (4 tests) |
+| `src/decoder.zig` | `pgoutput` logical decoding plugin parser, relation cache, context stitching (20 tests) |
+| `src/storage.zig` | Change persistence, schema migration, JSON serialization, retry logic, automatic reconnection (10 tests) |
+| `src/config.zig` | Environment variable parsing, validation (7 tests) |
 | `src/health.zig` | TCP health check server (1 test) |
+| `src/metrics.zig` | Prometheus metrics collection and HTTP exposition endpoint (5 tests) |
 | `src/main.zig` | Entry point, signal handling, reconnection loop, graceful shutdown |
 
-**Total: 47 unit tests**
+**Total: 58 unit tests**
 
 ### Data Flow
 

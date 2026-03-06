@@ -20,7 +20,7 @@ Same functionality. Same `changes` table. Same ORM packages. **3,100x smaller.**
 | **Startup time** | 30–60 seconds | &lt;1 ms | **instant** |
 | **Processes** | 4+ (sh, java, nats, node) | 1 | single process |
 | **Runtime deps** | JRE, Node.js, NATS, pnpm, MikroORM | 0 | zero dependencies |
-| **Unit tests** | — | 42 | built-in Zig test runner |
+| **Unit tests** | — | 58 | built-in Zig test runner |
 
 ## Why Rewrite?
 
@@ -60,7 +60,7 @@ DB_HOST=127.0.0.1 DB_NAME=mydb DB_USER=postgres DB_PASSWORD=secret ./zig-out/bin
 
 ### Pre-built Binaries
 
-Download from [GitHub Releases](https://github.com/deanmarano/bemi-io/releases):
+Download from [GitHub Releases](https://github.com/deanmarano/zemi/releases):
 
 | Binary | Platform | Size |
 |--------|----------|------|
@@ -75,6 +75,6 @@ Zemi is a **drop-in replacement** for the original Bemi worker:
 
 - **Same `changes` table schema** — existing queries work without modification
 - **Same environment variables** — `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
-- **Same ORM packages** — all [supported ORM packages](/#supported-orms) work without changes
+- **Same ORM packages** — all [supported ORM packages](/#supported-orm-packages) work without changes
 - **Same replication slot** — Zemi picks up exactly where Bemi left off
 - **Same `_bemi` context protocol** — ORM packages send context via `pg_logical_emit_message`, and Zemi stitches it identically

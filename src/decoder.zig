@@ -638,7 +638,7 @@ pub const Decoder = struct {
         commit: []Change,
         /// A mid-transaction flush due to exceeding max_transaction_changes.
         /// The transaction is still in progress; more changes or a commit will follow.
-        /// Context is NOT stamped on these changes (it may arrive later in the transaction).
+        /// Context IS stamped on these changes if the _bemi message arrived before the flush.
         flush: []Change,
     };
 
@@ -702,9 +702,9 @@ pub const Decoder = struct {
                 self.current_commit_timestamp = commit.commit_timestamp;
                 log.debug("COMMIT xid={d} changes={d}", .{ self.current_xid, self.transaction_changes.items.len });
 
-                // Stamp context onto all changes in this transaction.
-                // Note: changes that were already flushed early (via max_transaction_changes)
-                // do NOT get context stamped — this is a known trade-off of streaming mode.
+                // Stamp context onto all remaining changes in this transaction.
+                // Changes flushed early (via max_transaction_changes) were already
+                // stamped with context at flush time if it was available then.
                 if (self.transaction_context) |ctx| {
                     for (self.transaction_changes.items) |*change| {
                         change.context = try self.allocator.dupe(u8, ctx);
@@ -967,6 +967,18 @@ pub const Decoder = struct {
                         self.current_xid,
                         limit,
                     });
+
+                    // Stamp context onto flushed changes if already available.
+                    // ORM packages typically emit _bemi context at the start of a
+                    // transaction (before DML), so context is usually available here.
+                    // We dupe the context string for each change and keep the original
+                    // in transaction_context for subsequent flushes and the final commit.
+                    if (self.transaction_context) |ctx| {
+                        for (self.transaction_changes.items) |*change| {
+                            change.context = try self.allocator.dupe(u8, ctx);
+                        }
+                    }
+
                     const changes = try self.transaction_changes.toOwnedSlice();
                     return .{ .flush = changes };
                 }
@@ -2023,7 +2035,7 @@ test "Decoder mid-transaction flush when max_transaction_changes exceeded" {
     allocator.free(remaining);
 }
 
-test "Decoder mid-transaction flush: context only stamped on unflushed changes" {
+test "Decoder mid-transaction flush: context stamped on flushed changes when available" {
     const allocator = std.testing.allocator;
     const test_config = Config{};
     var dec = Decoder.init(allocator, "testdb", &test_config);
@@ -2039,13 +2051,13 @@ test "Decoder mid-transaction flush: context only stamped on unflushed changes" 
     defer allocator.free(rel_data);
     _ = try dec.decode(rel_data, 910);
 
-    // 3. _bemi context message
+    // 3. _bemi context message (arrives BEFORE any DML, as ORMs typically do)
     const context_json = "{\"user_id\": \"flush_test\"}";
     const bemi_msg = try buildTestBemiMessage(allocator, "_bemi", context_json, true);
     defer allocator.free(bemi_msg);
     _ = try dec.decode(bemi_msg, 920);
 
-    // 4. First insert — triggers flush (1 >= 1). Flushed changes do NOT get context.
+    // 4. First insert — triggers flush (1 >= 1). Context IS stamped because _bemi arrived first.
     const ins1 = try buildTestInsertMsg(allocator, 16384);
     defer allocator.free(ins1);
     const result1 = try dec.decode(ins1, 930);
@@ -2054,15 +2066,16 @@ test "Decoder mid-transaction flush: context only stamped on unflushed changes" 
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqual(@as(usize, 1), flushed.len);
-    // Flushed changes should NOT have context (known trade-off)
-    try std.testing.expect(flushed[0].context == null);
+    // Flushed changes now get context when it was available before flush
+    try std.testing.expect(flushed[0].context != null);
+    try std.testing.expectEqualStrings(context_json, flushed[0].context.?);
 
     for (flushed) |*c| {
         c.deinit(allocator);
     }
     allocator.free(flushed);
 
-    // 5. Second insert — triggers another flush
+    // 5. Second insert — triggers another flush. Context still available from same txn.
     const ins2 = try buildTestInsertMsg(allocator, 16384);
     defer allocator.free(ins2);
     const result2 = try dec.decode(ins2, 940);
@@ -2070,14 +2083,15 @@ test "Decoder mid-transaction flush: context only stamped on unflushed changes" 
         .flush => |c| c,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expect(flushed2[0].context == null);
+    try std.testing.expect(flushed2[0].context != null);
+    try std.testing.expectEqualStrings(context_json, flushed2[0].context.?);
 
     for (flushed2) |*c| {
         c.deinit(allocator);
     }
     allocator.free(flushed2);
 
-    // 6. Third insert — will also be flushed
+    // 6. Third insert — also flushed with context
     const ins3 = try buildTestInsertMsg(allocator, 16384);
     defer allocator.free(ins3);
     const result3 = try dec.decode(ins3, 950);
@@ -2085,8 +2099,8 @@ test "Decoder mid-transaction flush: context only stamped on unflushed changes" 
         .flush => |c| c,
         else => return error.TestUnexpectedResult,
     };
-    // This one also gets flushed without context
-    try std.testing.expect(flushed3[0].context == null);
+    try std.testing.expect(flushed3[0].context != null);
+    try std.testing.expectEqualStrings(context_json, flushed3[0].context.?);
     for (flushed3) |*c| {
         c.deinit(allocator);
     }
@@ -2096,6 +2110,61 @@ test "Decoder mid-transaction flush: context only stamped on unflushed changes" 
     const commit_data = buildTestCommitData();
     const commit_result = try dec.decode(&commit_data, 1000);
     // No remaining changes — all were flushed
+    try std.testing.expect(commit_result == .none);
+}
+
+test "Decoder mid-transaction flush: no context when _bemi arrives after flush" {
+    const allocator = std.testing.allocator;
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    dec.max_transaction_changes = 1; // flush after every change
+    defer dec.deinit();
+
+    // 1. Begin
+    const begin_data = buildTestBeginData(32);
+    _ = try dec.decode(&begin_data, 900);
+
+    // 2. Relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    // 3. First insert — triggers flush BEFORE _bemi message arrives
+    const ins1 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins1);
+    const result1 = try dec.decode(ins1, 920);
+    const flushed = switch (result1) {
+        .flush => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), flushed.len);
+    // No context available yet — flushed change has null context
+    try std.testing.expect(flushed[0].context == null);
+    for (flushed) |*c| c.deinit(allocator);
+    allocator.free(flushed);
+
+    // 4. _bemi context message arrives AFTER the first flush
+    const context_json = "{\"user_id\": \"late_context\"}";
+    const bemi_msg = try buildTestBemiMessage(allocator, "_bemi", context_json, true);
+    defer allocator.free(bemi_msg);
+    _ = try dec.decode(bemi_msg, 930);
+
+    // 5. Second insert — triggers flush. Now context IS available.
+    const ins2 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins2);
+    const result2 = try dec.decode(ins2, 940);
+    const flushed2 = switch (result2) {
+        .flush => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(flushed2[0].context != null);
+    try std.testing.expectEqualStrings(context_json, flushed2[0].context.?);
+    for (flushed2) |*c| c.deinit(allocator);
+    allocator.free(flushed2);
+
+    // 6. Commit with no remaining changes
+    const commit_data = buildTestCommitData();
+    const commit_result = try dec.decode(&commit_data, 1000);
     try std.testing.expect(commit_result == .none);
 }
 

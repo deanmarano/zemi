@@ -162,12 +162,15 @@ pub const ReplicationStream = struct {
 
     /// Start streaming WAL changes from the given LSN position.
     /// If start_lsn is 0, streams from the slot's confirmed_flush_lsn.
+    /// Uses pgoutput proto_version 2 with streaming enabled for large
+    /// transaction support (server sends StreamStart/StreamStop/StreamCommit/
+    /// StreamAbort messages instead of buffering entire transactions).
     pub fn startReplication(self: *ReplicationStream, start_lsn: u64) !void {
         var lsn_buf: [32]u8 = undefined;
         const lsn_str = if (start_lsn == 0) "0/0" else protocol.formatLsn(&lsn_buf, start_lsn);
 
         var sql_buf: [512]u8 = undefined;
-        const sql = std.fmt.bufPrint(&sql_buf, "START_REPLICATION SLOT {s} LOGICAL {s} (proto_version '1', publication_names '{s}', messages 'true')", .{
+        const sql = std.fmt.bufPrint(&sql_buf, "START_REPLICATION SLOT {s} LOGICAL {s} (proto_version '2', publication_names '{s}', messages 'true', streaming 'true')", .{
             self.config.slot_name,
             lsn_str,
             self.config.publication_name,

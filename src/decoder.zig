@@ -21,6 +21,11 @@ pub const PgOutputMessageType = enum(u8) {
     delete = 'D',
     truncate = 'T',
     message = 'M',
+    // proto_version >= 2: streaming transaction messages
+    stream_start = 'S',
+    stream_stop = 'E',
+    stream_commit = 'c',
+    stream_abort = 'A',
     _,
 };
 
@@ -122,6 +127,32 @@ pub const LogicalDecodingMessage = struct {
     content: []const u8,
 };
 
+// proto_version >= 2: streaming transaction message types
+
+pub const StreamStartMessage = struct {
+    xid: u32,
+    first_segment: u8, // 1 = first segment of this streamed transaction
+};
+
+pub const StreamStopMessage = struct {
+    // No payload — just a marker indicating the end of a streamed chunk.
+};
+
+pub const StreamCommitMessage = struct {
+    xid: u32,
+    flags: u8,
+    commit_lsn: u64,
+    end_lsn: u64,
+    commit_timestamp: i64,
+};
+
+pub const StreamAbortMessage = struct {
+    xid: u32,
+    sub_xid: u32,
+    abort_lsn: u64,
+    abort_timestamp: i64,
+};
+
 /// Union of all pgoutput message types.
 pub const PgOutputMessage = union(enum) {
     begin: BeginMessage,
@@ -134,6 +165,11 @@ pub const PgOutputMessage = union(enum) {
     origin: OriginMessage,
     pg_type: TypeMessage,
     message: LogicalDecodingMessage,
+    // proto_version >= 2: streaming transaction messages
+    stream_start: StreamStartMessage,
+    stream_stop: StreamStopMessage,
+    stream_commit: StreamCommitMessage,
+    stream_abort: StreamAbortMessage,
     unknown: u8,
 };
 
@@ -416,6 +452,43 @@ pub fn parsePgOutputMessage(allocator: std.mem.Allocator, data: []const u8) !PgO
                 .content = content,
             } };
         },
+        .stream_start => {
+            const xid = try reader.readUInt32();
+            const first_segment = try reader.readByte();
+            return .{ .stream_start = .{
+                .xid = xid,
+                .first_segment = first_segment,
+            } };
+        },
+        .stream_stop => {
+            return .{ .stream_stop = .{} };
+        },
+        .stream_commit => {
+            const xid = try reader.readUInt32();
+            const flags = try reader.readByte();
+            const commit_lsn = try reader.readUInt64();
+            const end_lsn = try reader.readUInt64();
+            const commit_timestamp = try reader.readInt64();
+            return .{ .stream_commit = .{
+                .xid = xid,
+                .flags = flags,
+                .commit_lsn = commit_lsn,
+                .end_lsn = end_lsn,
+                .commit_timestamp = commit_timestamp,
+            } };
+        },
+        .stream_abort => {
+            const xid = try reader.readUInt32();
+            const sub_xid = try reader.readUInt32();
+            const abort_lsn = try reader.readUInt64();
+            const abort_timestamp = try reader.readInt64();
+            return .{ .stream_abort = .{
+                .xid = xid,
+                .sub_xid = sub_xid,
+                .abort_lsn = abort_lsn,
+                .abort_timestamp = abort_timestamp,
+            } };
+        },
         _ => {
             return .{ .unknown = msg_type_byte };
         },
@@ -510,13 +583,18 @@ pub const RelationCache = struct {
 /// Stateful decoder that processes a stream of pgoutput messages,
 /// maintains a relation cache, and emits structured Change records.
 /// All returned Change records own their string data.
+///
+/// Supports both proto_version 1 (regular Begin/Commit transactions)
+/// and proto_version 2 (streaming transactions via StreamStart/StreamStop/
+/// StreamCommit/StreamAbort). Streaming transactions accumulate changes
+/// per-XID and can interleave with regular transactions.
 pub const Decoder = struct {
     allocator: std.mem.Allocator,
     relation_cache: RelationCache,
     database: []const u8,
     config: *const Config,
 
-    // Current transaction state
+    // Current transaction state (for regular Begin/Commit transactions)
     current_xid: u32 = 0,
     current_commit_timestamp: i64 = 0,
     in_transaction: bool = false,
@@ -525,6 +603,33 @@ pub const Decoder = struct {
 
     // Large transaction support
     max_transaction_changes: ?u32 = null,
+
+    // Streaming transaction state (proto_version >= 2)
+    // Multiple streamed transactions can be in-flight simultaneously.
+    streamed_txns: std.AutoHashMap(u32, StreamedTransaction) = undefined,
+    streaming_xid: ?u32 = null, // XID of the currently active StreamStart..StreamStop bracket
+
+    /// Per-XID state for a streaming transaction.
+    const StreamedTransaction = struct {
+        changes: std.ArrayList(Change),
+        context: ?[]const u8 = null,
+
+        fn init(allocator: std.mem.Allocator) StreamedTransaction {
+            return .{
+                .changes = std.ArrayList(Change).init(allocator),
+            };
+        }
+
+        fn deinit(self: *StreamedTransaction, allocator: std.mem.Allocator) void {
+            for (self.changes.items) |*change| {
+                change.deinit(allocator);
+            }
+            self.changes.deinit();
+            if (self.context) |ctx| {
+                allocator.free(ctx);
+            }
+        }
+    };
 
     pub const DecodeResult = union(enum) {
         /// No changes to return (e.g., Begin, Relation, mid-transaction DML below threshold).
@@ -544,6 +649,7 @@ pub const Decoder = struct {
             .database = database,
             .config = config,
             .transaction_changes = std.ArrayList(Change).init(allocator),
+            .streamed_txns = std.AutoHashMap(u32, StreamedTransaction).init(allocator),
         };
     }
 
@@ -555,6 +661,12 @@ pub const Decoder = struct {
             self.allocator.free(ctx);
             self.transaction_context = null;
         }
+        // Clean up any in-flight streamed transactions
+        var it = self.streamed_txns.valueIterator();
+        while (it.next()) |stxn| {
+            stxn.deinit(self.allocator);
+        }
+        self.streamed_txns.deinit();
     }
 
     fn freeChanges(self: *Decoder) void {
@@ -626,6 +738,9 @@ pub const Decoder = struct {
                     return .none;
                 };
 
+                const change_list = self.activeChangeList();
+                const xid = self.activeXid();
+
                 const lsn_str = try self.dupeFormatLsn(lsn);
                 errdefer self.allocator.free(lsn_str);
 
@@ -635,7 +750,7 @@ pub const Decoder = struct {
                 // Free the parsed (non-owned) tuple columns slice
                 self.allocator.free(ins.new_tuple.columns);
 
-                try self.transaction_changes.append(.{
+                try change_list.append(.{
                     .primary_key = pk,
                     .before = null,
                     .after = after,
@@ -644,7 +759,7 @@ pub const Decoder = struct {
                     .table = rel.name, // owned by cache
                     .operation = .CREATE,
                     .committed_at = self.current_commit_timestamp,
-                    .transaction_id = self.current_xid,
+                    .transaction_id = xid,
                     .position = lsn_str,
                 });
             },
@@ -655,6 +770,9 @@ pub const Decoder = struct {
                     self.allocator.free(upd.new_tuple.columns);
                     return .none;
                 };
+
+                const change_list = self.activeChangeList();
+                const xid = self.activeXid();
 
                 const lsn_str = try self.dupeFormatLsn(lsn);
                 errdefer self.allocator.free(lsn_str);
@@ -670,7 +788,7 @@ pub const Decoder = struct {
                 if (upd.old_tuple) |old| self.allocator.free(old.columns);
                 self.allocator.free(upd.new_tuple.columns);
 
-                try self.transaction_changes.append(.{
+                try change_list.append(.{
                     .primary_key = pk,
                     .before = before,
                     .after = after,
@@ -679,7 +797,7 @@ pub const Decoder = struct {
                     .table = rel.name,
                     .operation = .UPDATE,
                     .committed_at = self.current_commit_timestamp,
-                    .transaction_id = self.current_xid,
+                    .transaction_id = xid,
                     .position = lsn_str,
                 });
             },
@@ -690,6 +808,9 @@ pub const Decoder = struct {
                     return .none;
                 };
 
+                const change_list = self.activeChangeList();
+                const xid = self.activeXid();
+
                 const lsn_str = try self.dupeFormatLsn(lsn);
                 errdefer self.allocator.free(lsn_str);
 
@@ -698,7 +819,7 @@ pub const Decoder = struct {
 
                 self.allocator.free(del.old_tuple.columns);
 
-                try self.transaction_changes.append(.{
+                try change_list.append(.{
                     .primary_key = pk,
                     .before = before,
                     .after = null,
@@ -707,11 +828,14 @@ pub const Decoder = struct {
                     .table = rel.name,
                     .operation = .DELETE,
                     .committed_at = self.current_commit_timestamp,
-                    .transaction_id = self.current_xid,
+                    .transaction_id = xid,
                     .position = lsn_str,
                 });
             },
             .truncate => |trunc| {
+                const change_list = self.activeChangeList();
+                const xid = self.activeXid();
+
                 for (trunc.relation_ids) |rel_id| {
                     const rel = self.relation_cache.get(rel_id) orelse {
                         log.warn("TRUNCATE for unknown relation_id={d}", .{rel_id});
@@ -720,7 +844,7 @@ pub const Decoder = struct {
 
                     const lsn_str = try self.dupeFormatLsn(lsn);
 
-                    try self.transaction_changes.append(.{
+                    try change_list.append(.{
                         .primary_key = try self.allocator.dupe(u8, ""),
                         .before = null,
                         .after = null,
@@ -729,7 +853,7 @@ pub const Decoder = struct {
                         .table = rel.name,
                         .operation = .TRUNCATE,
                         .committed_at = self.current_commit_timestamp,
-                        .transaction_id = self.current_xid,
+                        .transaction_id = xid,
                         .position = lsn_str,
                     });
                 }
@@ -749,15 +873,84 @@ pub const Decoder = struct {
                     is_transactional,
                 });
 
-                // Detect _bemi-prefixed transactional messages for context stitching
+                // Detect _bemi-prefixed transactional messages for context stitching.
+                // Route context to the correct transaction (streamed or regular).
                 if (is_transactional and std.mem.startsWith(u8, msg_data.prefix, "_bemi")) {
-                    // Free any previously stored context in this transaction
-                    if (self.transaction_context) |old_ctx| {
-                        self.allocator.free(old_ctx);
+                    const duped_content = try self.allocator.dupe(u8, msg_data.content);
+
+                    if (self.streaming_xid) |sxid| {
+                        // Inside a streaming bracket — store context on the streamed txn
+                        if (self.streamed_txns.getPtr(sxid)) |stxn| {
+                            if (stxn.context) |old_ctx| self.allocator.free(old_ctx);
+                            stxn.context = duped_content;
+                        } else {
+                            self.allocator.free(duped_content);
+                        }
+                    } else {
+                        // Regular transaction
+                        if (self.transaction_context) |old_ctx| self.allocator.free(old_ctx);
+                        self.transaction_context = duped_content;
                     }
-                    self.transaction_context = try self.allocator.dupe(u8, msg_data.content);
                     log.debug("captured _bemi context: {d} bytes", .{msg_data.content.len});
                 }
+            },
+            // proto_version >= 2: streaming transaction messages
+            .stream_start => |ss| {
+                log.debug("STREAM_START xid={d} first={d}", .{ ss.xid, ss.first_segment });
+
+                // Create the per-XID buffer if this is the first segment
+                if (!self.streamed_txns.contains(ss.xid)) {
+                    try self.streamed_txns.put(ss.xid, StreamedTransaction.init(self.allocator));
+                }
+                self.streaming_xid = ss.xid;
+            },
+            .stream_stop => {
+                log.debug("STREAM_STOP (xid={?d})", .{self.streaming_xid});
+                self.streaming_xid = null;
+            },
+            .stream_commit => |sc| {
+                log.debug("STREAM_COMMIT xid={d}", .{sc.xid});
+
+                if (self.streamed_txns.fetchRemove(sc.xid)) |kv| {
+                    var stxn = kv.value;
+
+                    // Stamp context onto all accumulated changes
+                    if (stxn.context) |ctx| {
+                        for (stxn.changes.items) |*change| {
+                            change.context = try self.allocator.dupe(u8, ctx);
+                            change.committed_at = sc.commit_timestamp;
+                        }
+                        self.allocator.free(ctx);
+                        stxn.context = null;
+                    } else {
+                        // Even without context, update committed_at to the actual commit time
+                        for (stxn.changes.items) |*change| {
+                            change.committed_at = sc.commit_timestamp;
+                        }
+                    }
+
+                    if (stxn.changes.items.len > 0) {
+                        const changes = try stxn.changes.toOwnedSlice();
+                        stxn.changes.deinit(); // deinit the empty ArrayList
+                        return .{ .commit = changes };
+                    }
+                    stxn.changes.deinit();
+                }
+                return .none;
+            },
+            .stream_abort => |sa| {
+                log.debug("STREAM_ABORT xid={d} sub_xid={d}", .{ sa.xid, sa.sub_xid });
+
+                // Discard all buffered changes for this transaction
+                if (self.streamed_txns.fetchRemove(sa.xid)) |kv| {
+                    var stxn = kv.value;
+                    stxn.deinit(self.allocator);
+                }
+                // If we were in the middle of streaming this XID, clear the bracket
+                if (self.streaming_xid) |sxid| {
+                    if (sxid == sa.xid) self.streaming_xid = null;
+                }
+                return .none;
             },
             .unknown => |t| {
                 log.warn("unknown pgoutput message type: 0x{x}", .{t});
@@ -765,7 +958,8 @@ pub const Decoder = struct {
         }
 
         // Check if we need to flush early due to max_transaction_changes
-        if (self.in_transaction) {
+        // (only for regular transactions; streamed transactions are server-managed)
+        if (self.in_transaction and self.streaming_xid == null) {
             if (self.max_transaction_changes) |limit| {
                 if (self.transaction_changes.items.len >= limit) {
                     log.info("flushing {d} changes mid-transaction (xid={d}, limit={d})", .{
@@ -779,6 +973,23 @@ pub const Decoder = struct {
             }
         }
         return .none;
+    }
+
+    /// Returns the active change list: the streamed transaction's list if we're
+    /// inside a StreamStart..StreamStop bracket, otherwise the regular transaction list.
+    fn activeChangeList(self: *Decoder) *std.ArrayList(Change) {
+        if (self.streaming_xid) |sxid| {
+            if (self.streamed_txns.getPtr(sxid)) |stxn| {
+                return &stxn.changes;
+            }
+        }
+        return &self.transaction_changes;
+    }
+
+    /// Returns the active XID: the streaming XID if inside a bracket,
+    /// otherwise the regular transaction's XID.
+    fn activeXid(self: *Decoder) u32 {
+        return self.streaming_xid orelse self.current_xid;
     }
 
     // ========================================================================
@@ -2142,4 +2353,311 @@ test "column exclusion: schema-qualified exclusion" {
 
     // id still preserved (key column)
     try std.testing.expectEqualStrings("42", after[0].value.text);
+}
+
+// ============================================================================
+// Streaming transaction test helpers
+// ============================================================================
+
+fn buildStreamStartData(xid: u32, first_segment: u8) [6]u8 {
+    var buf: [6]u8 = undefined;
+    buf[0] = 'S';
+    mem.writeInt(u32, buf[1..5], xid, .big);
+    buf[5] = first_segment;
+    return buf;
+}
+
+fn buildStreamStopData() [1]u8 {
+    return .{'E'};
+}
+
+fn buildStreamCommitData(xid: u32, commit_timestamp: i64) [30]u8 {
+    var buf: [30]u8 = undefined;
+    buf[0] = 'c';
+    mem.writeInt(u32, buf[1..5], xid, .big);
+    buf[5] = 0; // flags
+    mem.writeInt(u64, buf[6..14], 2000, .big); // commit_lsn
+    mem.writeInt(u64, buf[14..22], 2100, .big); // end_lsn
+    mem.writeInt(i64, buf[22..30], commit_timestamp, .big);
+    return buf;
+}
+
+fn buildStreamAbortData(xid: u32, sub_xid: u32) [25]u8 {
+    var buf: [25]u8 = undefined;
+    buf[0] = 'A';
+    mem.writeInt(u32, buf[1..5], xid, .big);
+    mem.writeInt(u32, buf[5..9], sub_xid, .big);
+    mem.writeInt(u64, buf[9..17], 3000, .big); // abort_lsn
+    mem.writeInt(i64, buf[17..25], 600000, .big); // abort_timestamp
+    return buf;
+}
+
+// ============================================================================
+// Streaming transaction tests
+// ============================================================================
+
+test "parse StreamStart message" {
+    const data = buildStreamStartData(100, 1);
+    const msg = try parsePgOutputMessage(std.testing.allocator, &data);
+    switch (msg) {
+        .stream_start => |ss| {
+            try std.testing.expectEqual(@as(u32, 100), ss.xid);
+            try std.testing.expectEqual(@as(u8, 1), ss.first_segment);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse StreamStop message" {
+    const data = buildStreamStopData();
+    const msg = try parsePgOutputMessage(std.testing.allocator, &data);
+    switch (msg) {
+        .stream_stop => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse StreamCommit message" {
+    const data = buildStreamCommitData(100, 700000);
+    const msg = try parsePgOutputMessage(std.testing.allocator, &data);
+    switch (msg) {
+        .stream_commit => |sc| {
+            try std.testing.expectEqual(@as(u32, 100), sc.xid);
+            try std.testing.expectEqual(@as(u64, 2000), sc.commit_lsn);
+            try std.testing.expectEqual(@as(i64, 700000), sc.commit_timestamp);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "streaming transaction: StreamStart, Insert, StreamStop, StreamCommit" {
+    const allocator = std.testing.allocator;
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    defer dec.deinit();
+
+    // Load relation into cache first (outside streaming bracket)
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 100);
+
+    // 1. StreamStart (xid=100, first_segment=1)
+    const ss_data = buildStreamStartData(100, 1);
+    const r1 = try dec.decode(&ss_data, 200);
+    try std.testing.expect(r1 == .none);
+
+    // 2. Insert inside streaming bracket
+    const ins = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins);
+    const r2 = try dec.decode(ins, 210);
+    try std.testing.expect(r2 == .none);
+
+    // 3. StreamStop
+    const se_data = buildStreamStopData();
+    const r3 = try dec.decode(&se_data, 220);
+    try std.testing.expect(r3 == .none);
+
+    // 4. StreamCommit
+    const sc_data = buildStreamCommitData(100, 800000);
+    const result = try dec.decode(&sc_data, 300);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqual(@as(u32, 100), changes[0].transaction_id);
+    try std.testing.expectEqual(Operation.CREATE, changes[0].operation);
+    // committed_at should be updated to the stream commit timestamp
+    try std.testing.expectEqual(@as(i64, 800000), changes[0].committed_at);
+}
+
+test "streaming transaction: StreamAbort discards changes" {
+    const allocator = std.testing.allocator;
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    defer dec.deinit();
+
+    // Load relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 100);
+
+    // StreamStart
+    const ss_data = buildStreamStartData(200, 1);
+    _ = try dec.decode(&ss_data, 200);
+
+    // Insert inside streaming bracket
+    const ins = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins);
+    _ = try dec.decode(ins, 210);
+
+    // StreamStop
+    const se_data = buildStreamStopData();
+    _ = try dec.decode(&se_data, 220);
+
+    // StreamAbort — should discard all changes
+    const sa_data = buildStreamAbortData(200, 200);
+    const result = try dec.decode(&sa_data, 300);
+    try std.testing.expect(result == .none);
+
+    // Verify the streamed txn was cleaned up
+    try std.testing.expect(!dec.streamed_txns.contains(200));
+}
+
+test "streaming transaction: multiple segments accumulate changes" {
+    const allocator = std.testing.allocator;
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    defer dec.deinit();
+
+    // Load relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 100);
+
+    // Segment 1: StreamStart, Insert, StreamStop
+    const ss1 = buildStreamStartData(300, 1);
+    _ = try dec.decode(&ss1, 200);
+
+    const ins1 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins1);
+    _ = try dec.decode(ins1, 210);
+
+    const se1 = buildStreamStopData();
+    _ = try dec.decode(&se1, 220);
+
+    // Segment 2: StreamStart (not first), Insert, StreamStop
+    const ss2 = buildStreamStartData(300, 0);
+    _ = try dec.decode(&ss2, 300);
+
+    const ins2 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins2);
+    _ = try dec.decode(ins2, 310);
+
+    const se2 = buildStreamStopData();
+    _ = try dec.decode(&se2, 320);
+
+    // StreamCommit — should return all 2 accumulated changes
+    const sc_data = buildStreamCommitData(300, 900000);
+    const result = try dec.decode(&sc_data, 400);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), changes.len);
+    try std.testing.expectEqual(@as(u32, 300), changes[0].transaction_id);
+    try std.testing.expectEqual(@as(u32, 300), changes[1].transaction_id);
+}
+
+test "streaming transaction: context stitching with _bemi in stream" {
+    const allocator = std.testing.allocator;
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    defer dec.deinit();
+
+    // Load relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 100);
+
+    // StreamStart
+    const ss_data = buildStreamStartData(400, 1);
+    _ = try dec.decode(&ss_data, 200);
+
+    // Insert
+    const ins = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins);
+    _ = try dec.decode(ins, 210);
+
+    // _bemi context message inside the stream bracket
+    const bemi_msg = try buildTestBemiMessage(allocator, "_bemi", "{\"user\":\"test\"}", true);
+    defer allocator.free(bemi_msg);
+    _ = try dec.decode(bemi_msg, 215);
+
+    // StreamStop
+    const se_data = buildStreamStopData();
+    _ = try dec.decode(&se_data, 220);
+
+    // StreamCommit — context should be stamped on changes
+    const sc_data = buildStreamCommitData(400, 950000);
+    const result = try dec.decode(&sc_data, 300);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    defer {
+        for (changes) |*c| c.deinit(allocator);
+        allocator.free(changes);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("{\"user\":\"test\"}", changes[0].context.?);
+}
+
+test "streaming transaction interleaved with regular transaction" {
+    const allocator = std.testing.allocator;
+    const test_config = Config{};
+    var dec = Decoder.init(allocator, "testdb", &test_config);
+    defer dec.deinit();
+
+    // Load relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 100);
+
+    // Start streaming xid=500
+    const ss_data = buildStreamStartData(500, 1);
+    _ = try dec.decode(&ss_data, 200);
+
+    const ins1 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins1);
+    _ = try dec.decode(ins1, 210);
+
+    const se_data = buildStreamStopData();
+    _ = try dec.decode(&se_data, 220);
+
+    // While streaming txn is in-flight (between segments), a regular txn arrives
+    const begin_data = buildTestBeginData(501);
+    _ = try dec.decode(&begin_data, 230);
+
+    const ins2 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins2);
+    _ = try dec.decode(ins2, 240);
+
+    const commit_data = buildTestCommitData();
+    const regular_result = try dec.decode(&commit_data, 250);
+    // Regular transaction should commit with 1 change
+    const regular_changes = switch (regular_result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), regular_changes.len);
+    try std.testing.expectEqual(@as(u32, 501), regular_changes[0].transaction_id);
+    for (regular_changes) |*c| c.deinit(allocator);
+    allocator.free(regular_changes);
+
+    // Now commit the streaming transaction
+    const sc_data = buildStreamCommitData(500, 1000000);
+    const stream_result = try dec.decode(&sc_data, 300);
+    const stream_changes = switch (stream_result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    defer {
+        for (stream_changes) |*c| c.deinit(allocator);
+        allocator.free(stream_changes);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), stream_changes.len);
+    try std.testing.expectEqual(@as(u32, 500), stream_changes[0].transaction_id);
 }

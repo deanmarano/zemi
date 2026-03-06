@@ -6,16 +6,18 @@ const log = std.log.scoped(.health);
 
 /// Minimal TCP health check server for container orchestration.
 /// Accepts connections and responds with "HTTP/1.1 200 OK\r\n\r\nok\n".
-/// Runs in a background thread.
+/// Runs in a background thread. Heap-allocated so the thread's pointer
+/// remains valid after start() returns.
 pub const HealthServer = struct {
     thread: std.Thread,
     server_fd: posix.socket_t,
     should_stop: std.atomic.Value(bool),
     bound_port: u16,
+    allocator: std.mem.Allocator,
 
     const http_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
 
-    pub fn start(port: u16) !HealthServer {
+    pub fn start(port: u16, allocator: std.mem.Allocator) !*HealthServer {
         const addr = net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
         const server_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer posix.close(server_fd);
@@ -34,14 +36,16 @@ pub const HealthServer = struct {
         const addr_in: *const posix.sockaddr.in = @ptrCast(@alignCast(&addr_storage));
         const bound_port = std.mem.bigToNative(u16, addr_in.port);
 
-        var hs = HealthServer{
+        const hs = try allocator.create(HealthServer);
+        hs.* = .{
             .thread = undefined,
             .server_fd = server_fd,
             .should_stop = std.atomic.Value(bool).init(false),
             .bound_port = bound_port,
+            .allocator = allocator,
         };
 
-        hs.thread = try std.Thread.spawn(.{}, acceptLoop, .{&hs});
+        hs.thread = try std.Thread.spawn(.{}, acceptLoop, .{hs});
         return hs;
     }
 
@@ -57,6 +61,7 @@ pub const HealthServer = struct {
 
         self.thread.join();
         posix.close(self.server_fd);
+        self.allocator.destroy(self);
     }
 
     fn acceptLoop(self: *HealthServer) void {

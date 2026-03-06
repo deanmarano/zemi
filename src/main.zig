@@ -97,9 +97,9 @@ pub fn main() !void {
     var m = Metrics{ .start_time_secs = std.time.timestamp() };
 
     // Start health check server if configured
-    var health_server: ?health.HealthServer = null;
+    var health_server: ?*health.HealthServer = null;
     if (config.health_port) |port| {
-        if (health.HealthServer.start(port)) |hs| {
+        if (health.HealthServer.start(port, allocator)) |hs| {
             health_server = hs;
             log.info("health check server listening on port {d}", .{port});
         } else |err| {
@@ -107,14 +107,14 @@ pub fn main() !void {
         }
     }
     defer {
-        if (health_server) |*hs| {
+        if (health_server) |hs| {
             hs.stop();
             log.info("health check server stopped", .{});
         }
     }
 
     // Start metrics server if configured
-    var metrics_server: ?MetricsServer = null;
+    var metrics_server: ?*MetricsServer = null;
     if (config.metrics_port) |port| {
         if (MetricsServer.start(port, &m, allocator)) |ms| {
             metrics_server = ms;
@@ -124,7 +124,7 @@ pub fn main() !void {
         }
     }
     defer {
-        if (metrics_server) |*ms| {
+        if (metrics_server) |ms| {
             ms.stop();
             log.info("metrics server stopped", .{});
         }

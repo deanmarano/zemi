@@ -815,6 +815,16 @@ if [ "$SSL_AVAILABLE" = true ]; then
 
                 SSL_FULL_OP=$(ssl_query "SELECT operation FROM changes WHERE \"table\" = 'ssl_test_items' AND after->>'name' = 'ssl-verify-full-item' LIMIT 1;" || echo "")
                 assert_eq "SSL verify-full: INSERT tracked" "CREATE" "$SSL_FULL_OP"
+
+                # Debug: show Zemi logs and changes table if assertion failed
+                if [ "$SSL_FULL_OP" != "CREATE" ]; then
+                    echo "  --- SSL verify-full: all changes in table:"
+                    ssl_query "SELECT operation, \"table\", after->>'name' FROM changes ORDER BY created_at;" || true
+                    if [ -f /tmp/zemi-e2e-ssl-full.log ]; then
+                        echo "  --- SSL verify-full Zemi logs:"
+                        cat /tmp/zemi-e2e-ssl-full.log
+                    fi
+                fi
             else
                 echo "  $(red "FAIL") Zemi failed to start with SSL (verify-full)"
                 echo "  --- SSL verify-full Zemi logs:"
@@ -977,7 +987,9 @@ if kill -0 "$METRICS_ZEMI_PID" 2>/dev/null; then
 
     # Print metrics Zemi logs for debugging if any assertions failed
     if [ -f /tmp/zemi-e2e-metrics.log ]; then
-        echo "  --- Metrics Zemi logs:"
+        echo "  --- Metrics Zemi logs (first 30 lines):"
+        head -30 /tmp/zemi-e2e-metrics.log
+        echo "  --- Metrics Zemi logs (last 20 lines):"
         tail -20 /tmp/zemi-e2e-metrics.log
     fi
 else

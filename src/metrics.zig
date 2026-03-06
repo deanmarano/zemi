@@ -184,7 +184,10 @@ pub const MetricsServer = struct {
     metrics: *const Metrics,
     allocator: std.mem.Allocator,
 
-    pub fn start(port: u16, m: *const Metrics, allocator: std.mem.Allocator) !MetricsServer {
+    /// Start the metrics HTTP server on the given port.
+    /// The server is heap-allocated so that the background thread's
+    /// pointer remains valid after this function returns.
+    pub fn start(port: u16, m: *const Metrics, allocator: std.mem.Allocator) !*MetricsServer {
         const addr = net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
         const server_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer posix.close(server_fd);
@@ -203,7 +206,8 @@ pub const MetricsServer = struct {
         const addr_in: *const posix.sockaddr.in = @ptrCast(@alignCast(&addr_storage));
         const bound_port = std.mem.bigToNative(u16, addr_in.port);
 
-        var ms = MetricsServer{
+        const ms = try allocator.create(MetricsServer);
+        ms.* = .{
             .thread = undefined,
             .server_fd = server_fd,
             .should_stop = std.atomic.Value(bool).init(false),
@@ -212,7 +216,7 @@ pub const MetricsServer = struct {
             .allocator = allocator,
         };
 
-        ms.thread = try std.Thread.spawn(.{}, acceptLoop, .{&ms});
+        ms.thread = try std.Thread.spawn(.{}, acceptLoop, .{ms});
         return ms;
     }
 
@@ -228,6 +232,7 @@ pub const MetricsServer = struct {
 
         self.thread.join();
         posix.close(self.server_fd);
+        self.allocator.destroy(self);
     }
 
     fn acceptLoop(self: *MetricsServer) void {

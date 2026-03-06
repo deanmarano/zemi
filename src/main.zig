@@ -331,7 +331,7 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
                         Metrics.inc(&m.changes_filtered_total);
                         continue;
                     }
-                    if (!config.shouldTrackTable(change.table)) {
+                    if (!config.shouldTrackTable(change.schema, change.table)) {
                         log.debug("skipping untracked table: {s}", .{change.table});
                         Metrics.inc(&m.changes_filtered_total);
                         continue;

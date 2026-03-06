@@ -64,7 +64,9 @@ pub const Config = struct {
     // Logging
     log_level: std.log.Level = .info,
 
-    // Table filtering: comma-separated list (e.g. "users,orders,products")
+    // Table filtering: comma-separated list (e.g. "users,orders,products"
+    // or "public.users,myschema.orders"). Schema-qualified entries match
+    // only in that schema; bare names match any schema (backward compatible).
     // null = track all tables (default)
     tables: ?[]const u8 = null,
 
@@ -106,6 +108,13 @@ pub const Config = struct {
     // once (on first slot creation). Default false.
     initial_snapshot: bool = false,
 
+    // Partitioned table support: when true, the publication is created with
+    // publish_via_partition_root = true, so changes to partitioned tables
+    // are reported under the parent (root) table name instead of the
+    // individual partition name. This ensures TABLES filtering works
+    // correctly for partitioned tables. Default true.
+    publish_via_partition_root: bool = true,
+
     /// Returns the effective destination host (falls back to source).
     pub fn getDestHost(self: Config) []const u8 {
         return self.dest_db_host orelse self.db_host;
@@ -129,16 +138,34 @@ pub const Config = struct {
         return self.dest_db_ssl_root_cert orelse self.db_ssl_root_cert;
     }
 
-    /// Check if a given table name should be tracked.
+    /// Check if a given table should be tracked.
     /// Returns true if no filter is configured (track all), or if the
-    /// table name appears in the TABLES comma-separated list.
-    pub fn shouldTrackTable(self: Config, table: []const u8) bool {
+    /// table appears in the TABLES comma-separated list.
+    /// TABLES entries can be bare names ("users") which match any schema,
+    /// or schema-qualified ("public.users") which match only that schema.
+    pub fn shouldTrackTable(self: Config, schema: []const u8, table: []const u8) bool {
         const tables_str = self.tables orelse return true;
         var iter = std.mem.splitScalar(u8, tables_str, ',');
         while (iter.next()) |entry| {
             const trimmed = std.mem.trim(u8, entry, " \t");
-            if (trimmed.len > 0 and std.mem.eql(u8, trimmed, table)) {
-                return true;
+            if (trimmed.len == 0) continue;
+
+            // Check if entry is schema-qualified (contains a dot)
+            if (std.mem.indexOfScalar(u8, trimmed, '.')) |dot_pos| {
+                // Schema-qualified: match both schema and table
+                const entry_schema = trimmed[0..dot_pos];
+                const entry_table = trimmed[dot_pos + 1 ..];
+                if (entry_schema.len > 0 and entry_table.len > 0 and
+                    std.mem.eql(u8, entry_schema, schema) and
+                    std.mem.eql(u8, entry_table, table))
+                {
+                    return true;
+                }
+            } else {
+                // Bare name: match table in any schema (backward compatible)
+                if (std.mem.eql(u8, trimmed, table)) {
+                    return true;
+                }
             }
         }
         return false;
@@ -353,6 +380,12 @@ pub const Config = struct {
             }
         }
 
+        if (std.posix.getenv("PUBLISH_VIA_PARTITION_ROOT")) |v| {
+            if (std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "no")) {
+                config.publish_via_partition_root = false;
+            }
+        }
+
         return config;
     }
 
@@ -502,6 +535,9 @@ pub const Config = struct {
         if (self.initial_snapshot) {
             log.info("config: initial_snapshot=true", .{});
         }
+        if (!self.publish_via_partition_root) {
+            log.info("config: publish_via_partition_root=false", .{});
+        }
         if (self.health_port) |port| {
             log.info("config: health_port={d}", .{port});
         }
@@ -523,25 +559,44 @@ pub const Config = struct {
 
 test "shouldTrackTable with no filter tracks everything" {
     const config = Config{};
-    try std.testing.expect(config.shouldTrackTable("users"));
-    try std.testing.expect(config.shouldTrackTable("orders"));
-    try std.testing.expect(config.shouldTrackTable("anything"));
+    try std.testing.expect(config.shouldTrackTable("public", "users"));
+    try std.testing.expect(config.shouldTrackTable("public", "orders"));
+    try std.testing.expect(config.shouldTrackTable("myschema", "anything"));
 }
 
-test "shouldTrackTable with filter matches only listed tables" {
+test "shouldTrackTable with bare names matches any schema" {
     const config = Config{ .tables = "users,orders,products" };
-    try std.testing.expect(config.shouldTrackTable("users"));
-    try std.testing.expect(config.shouldTrackTable("orders"));
-    try std.testing.expect(config.shouldTrackTable("products"));
-    try std.testing.expect(!config.shouldTrackTable("sessions"));
-    try std.testing.expect(!config.shouldTrackTable("changes"));
+    try std.testing.expect(config.shouldTrackTable("public", "users"));
+    try std.testing.expect(config.shouldTrackTable("myschema", "users"));
+    try std.testing.expect(config.shouldTrackTable("public", "orders"));
+    try std.testing.expect(config.shouldTrackTable("public", "products"));
+    try std.testing.expect(!config.shouldTrackTable("public", "sessions"));
+    try std.testing.expect(!config.shouldTrackTable("public", "changes"));
+}
+
+test "shouldTrackTable with schema-qualified names matches only that schema" {
+    const config = Config{ .tables = "public.users, myschema.orders" };
+    try std.testing.expect(config.shouldTrackTable("public", "users"));
+    try std.testing.expect(!config.shouldTrackTable("other", "users"));
+    try std.testing.expect(config.shouldTrackTable("myschema", "orders"));
+    try std.testing.expect(!config.shouldTrackTable("public", "orders"));
+}
+
+test "shouldTrackTable with mixed bare and schema-qualified names" {
+    const config = Config{ .tables = "users, public.orders" };
+    // Bare "users" matches any schema
+    try std.testing.expect(config.shouldTrackTable("public", "users"));
+    try std.testing.expect(config.shouldTrackTable("other", "users"));
+    // Schema-qualified "public.orders" matches only public
+    try std.testing.expect(config.shouldTrackTable("public", "orders"));
+    try std.testing.expect(!config.shouldTrackTable("other", "orders"));
 }
 
 test "shouldTrackTable trims whitespace" {
     const config = Config{ .tables = " users , orders " };
-    try std.testing.expect(config.shouldTrackTable("users"));
-    try std.testing.expect(config.shouldTrackTable("orders"));
-    try std.testing.expect(!config.shouldTrackTable("products"));
+    try std.testing.expect(config.shouldTrackTable("public", "users"));
+    try std.testing.expect(config.shouldTrackTable("public", "orders"));
+    try std.testing.expect(!config.shouldTrackTable("public", "products"));
 }
 
 test "validate catches empty required fields" {

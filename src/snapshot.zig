@@ -122,7 +122,7 @@ pub fn performSnapshot(
             continue;
         }
         // Apply TABLES filter if configured
-        if (!config.shouldTrackTable(table_info.table)) {
+        if (!config.shouldTrackTable(table_info.schema, table_info.table)) {
             log.debug("snapshot: skipping untracked table '{s}'", .{table_info.table});
             continue;
         }

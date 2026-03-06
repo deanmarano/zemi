@@ -343,9 +343,15 @@ pub fn ensurePublication(allocator: std.mem.Allocator, config: Config) !void {
         const table_list = try buildPublicationTableList(allocator, tables_str);
         defer allocator.free(table_list);
 
+        // Build WITH clause for publish_via_partition_root if enabled
+        const with_clause: []const u8 = if (config.publish_via_partition_root)
+            " WITH (publish_via_partition_root = true)"
+        else
+            "";
+
         // Try CREATE PUBLICATION ... FOR TABLE ...
-        const create_sql = try std.fmt.allocPrint(allocator, "CREATE PUBLICATION {s} FOR TABLE {s}", .{
-            config.publication_name, table_list,
+        const create_sql = try std.fmt.allocPrint(allocator, "CREATE PUBLICATION {s} FOR TABLE {s}{s}", .{
+            config.publication_name, table_list, with_clause,
         });
         defer allocator.free(create_sql);
 
@@ -361,21 +367,58 @@ pub fn ensurePublication(allocator: std.mem.Allocator, config: Config) !void {
                 log.err("failed to alter publication '{s}': {}", .{ config.publication_name, alter_err });
                 return alter_err;
             };
+
+            // Set publish_via_partition_root on existing publication
+            if (config.publish_via_partition_root) {
+                const set_opt_sql = std.fmt.allocPrint(allocator, "ALTER PUBLICATION {s} SET (publish_via_partition_root = true)", .{
+                    config.publication_name,
+                }) catch return error.ServerError;
+                defer allocator.free(set_opt_sql);
+
+                conn.exec(set_opt_sql) catch |opt_err| {
+                    log.warn("failed to set publish_via_partition_root on publication '{s}': {}", .{ config.publication_name, opt_err });
+                };
+            }
         };
 
-        log.info("publication '{s}' ready (tables: {s})", .{ config.publication_name, table_list });
+        log.info("publication '{s}' ready (tables: {s}, partition_root={s})", .{
+            config.publication_name,
+            table_list,
+            if (config.publish_via_partition_root) "true" else "false",
+        });
     } else {
         // No table filter — publish all tables
-        var buf: [256]u8 = undefined;
-        const sql = std.fmt.bufPrint(&buf, "CREATE PUBLICATION {s} FOR ALL TABLES", .{
+        const with_clause: []const u8 = if (config.publish_via_partition_root)
+            " WITH (publish_via_partition_root = true)"
+        else
+            "";
+
+        var buf: [512]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buf, "CREATE PUBLICATION {s} FOR ALL TABLES{s}", .{
             config.publication_name,
+            with_clause,
         }) catch return error.ServerError;
 
         conn.exec(sql) catch {
             log.info("publication '{s}' may already exist, continuing", .{config.publication_name});
+
+            // Set publish_via_partition_root on existing publication
+            if (config.publish_via_partition_root) {
+                var opt_buf: [256]u8 = undefined;
+                const opt_sql = std.fmt.bufPrint(&opt_buf, "ALTER PUBLICATION {s} SET (publish_via_partition_root = true)", .{
+                    config.publication_name,
+                }) catch return error.ServerError;
+
+                conn.exec(opt_sql) catch |opt_err| {
+                    log.warn("failed to set publish_via_partition_root on publication '{s}': {}", .{ config.publication_name, opt_err });
+                };
+            }
         };
 
-        log.info("publication '{s}' ready (all tables)", .{config.publication_name});
+        log.info("publication '{s}' ready (all tables, partition_root={s})", .{
+            config.publication_name,
+            if (config.publish_via_partition_root) "true" else "false",
+        });
     }
 }
 

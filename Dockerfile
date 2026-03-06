@@ -27,8 +27,7 @@ RUN case "${TARGETARCH}" in \
         arm64) ZIG_TARGET="aarch64-linux-musl" ;; \
     esac && \
     zig build -Dtarget="${ZIG_TARGET}" -Doptimize=ReleaseSafe && \
-    cp zig-out/bin/zemi /zemi && \
-    strip /zemi || true
+    cp zig-out/bin/zemi /zemi
 
 # Stage 2: Minimal runtime image
 FROM scratch

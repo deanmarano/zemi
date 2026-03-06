@@ -45,9 +45,9 @@ pub const Config = struct {
     db_ssl_mode: SslMode = .disable,
     db_ssl_root_cert: ?[]const u8 = null, // path to custom CA cert file
 
-    // Replication settings
-    slot_name: []const u8 = "zemi",
-    publication_name: []const u8 = "zemi",
+    // Replication settings (defaults match original Bemi for drop-in compatibility)
+    slot_name: []const u8 = "bemi_local",
+    publication_name: []const u8 = "bemi",
 
     // Destination database (where changes are written)
     // Defaults to same as source database if not specified.
@@ -138,18 +138,24 @@ pub const Config = struct {
         if (std.posix.getenv("SLOT_NAME")) |v| config.slot_name = v;
         if (std.posix.getenv("PUBLICATION_NAME")) |v| config.publication_name = v;
 
-        // Destination database overrides (optional)
+        // Destination database overrides (optional).
+        // Accept both DEST_DB_* (new) and DESTINATION_DB_* (original Bemi) names
+        // for drop-in compatibility. The shorter DEST_DB_* form takes precedence.
+        if (std.posix.getenv("DESTINATION_DB_HOST")) |v| config.dest_db_host = v;
         if (std.posix.getenv("DEST_DB_HOST")) |v| config.dest_db_host = v;
-        if (std.posix.getenv("DEST_DB_PORT")) |v| {
+        if (std.posix.getenv("DESTINATION_DB_PORT") orelse std.posix.getenv("DEST_DB_PORT")) |v| {
             config.dest_db_port = std.fmt.parseUnsigned(u16, v, 10) catch blk: {
                 log.warn("invalid DEST_DB_PORT '{s}', ignoring", .{v});
                 break :blk null;
             };
         }
+        if (std.posix.getenv("DESTINATION_DB_NAME")) |v| config.dest_db_name = v;
         if (std.posix.getenv("DEST_DB_NAME")) |v| config.dest_db_name = v;
+        if (std.posix.getenv("DESTINATION_DB_USER")) |v| config.dest_db_user = v;
         if (std.posix.getenv("DEST_DB_USER")) |v| config.dest_db_user = v;
+        if (std.posix.getenv("DESTINATION_DB_PASSWORD")) |v| config.dest_db_password = v;
         if (std.posix.getenv("DEST_DB_PASSWORD")) |v| config.dest_db_password = v;
-        if (std.posix.getenv("DEST_DB_SSL_MODE")) |v| {
+        if (std.posix.getenv("DESTINATION_DB_SSL_MODE") orelse std.posix.getenv("DEST_DB_SSL_MODE")) |v| {
             if (SslMode.fromString(v)) |mode| {
                 config.dest_db_ssl_mode = mode;
             } else {

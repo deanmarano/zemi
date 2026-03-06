@@ -77,44 +77,63 @@ pub const Metrics = struct {
     }
 
     /// Render all metrics in Prometheus text exposition format.
+    /// Emits each metric with both `zemi_` and `bemi_` prefixes for
+    /// drop-in compatibility with existing dashboards and alerts.
     /// Caller must free the returned slice.
     pub fn render(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
         var buf = std.ArrayList(u8).init(allocator);
         errdefer buf.deinit();
 
-        // Counters
-        try appendCounter(&buf, "zemi_changes_processed_total", "Total changes processed.", &[_]LabeledValue{
-            .{ .labels = "operation=\"CREATE\"", .value = self.changes_created_total.load(.monotonic) },
-            .{ .labels = "operation=\"UPDATE\"", .value = self.changes_updated_total.load(.monotonic) },
-            .{ .labels = "operation=\"DELETE\"", .value = self.changes_deleted_total.load(.monotonic) },
-            .{ .labels = "operation=\"TRUNCATE\"", .value = self.changes_truncated_total.load(.monotonic) },
-        });
-
-        try appendSimpleCounter(&buf, "zemi_changes_filtered_total", "Changes skipped by table filter or feedback-loop filter.", self.changes_filtered_total.load(.monotonic));
-        try appendSimpleCounter(&buf, "zemi_changes_duplicated_total", "Changes skipped due to ON CONFLICT deduplication.", self.changes_duplicated_total.load(.monotonic));
-        try appendSimpleCounter(&buf, "zemi_transactions_processed_total", "Total committed transactions processed.", self.transactions_processed_total.load(.monotonic));
-        try appendSimpleCounter(&buf, "zemi_wal_messages_received_total", "Total WAL messages received.", self.wal_messages_received_total.load(.monotonic));
-        try appendSimpleCounter(&buf, "zemi_keepalives_received_total", "Total keepalive messages received.", self.keepalives_received_total.load(.monotonic));
-        try appendSimpleCounter(&buf, "zemi_decode_errors_total", "Total decode errors encountered.", self.decode_errors_total.load(.monotonic));
-        try appendSimpleCounter(&buf, "zemi_persist_errors_total", "Total persist errors encountered.", self.persist_errors_total.load(.monotonic));
-        try appendSimpleCounter(&buf, "zemi_storage_reconnections_total", "Total storage reconnections.", self.storage_reconnections_total.load(.monotonic));
-        try appendSimpleCounter(&buf, "zemi_replication_reconnections_total", "Total replication reconnections.", self.replication_reconnections_total.load(.monotonic));
-
-        // Gauges
+        // Snapshot all values once for consistency across both prefix passes.
+        const created = self.changes_created_total.load(.monotonic);
+        const updated = self.changes_updated_total.load(.monotonic);
+        const deleted = self.changes_deleted_total.load(.monotonic);
+        const truncated = self.changes_truncated_total.load(.monotonic);
+        const filtered = self.changes_filtered_total.load(.monotonic);
+        const duplicated = self.changes_duplicated_total.load(.monotonic);
+        const transactions = self.transactions_processed_total.load(.monotonic);
+        const wal_msgs = self.wal_messages_received_total.load(.monotonic);
+        const keepalives = self.keepalives_received_total.load(.monotonic);
+        const decode_errs = self.decode_errors_total.load(.monotonic);
+        const persist_errs = self.persist_errors_total.load(.monotonic);
+        const storage_reconns = self.storage_reconnections_total.load(.monotonic);
+        const repl_reconns = self.replication_reconnections_total.load(.monotonic);
         const received_lsn = self.last_received_lsn.load(.monotonic);
         const flushed_lsn = self.last_flushed_lsn.load(.monotonic);
         const lag = if (received_lsn >= flushed_lsn) received_lsn - flushed_lsn else 0;
-
-        try appendSimpleGauge(&buf, "zemi_replication_lag_bytes", "Replication lag in bytes (received - flushed LSN).", lag);
-        try appendSimpleGauge(&buf, "zemi_last_received_lsn", "Highest WAL position received.", received_lsn);
-        try appendSimpleGauge(&buf, "zemi_last_flushed_lsn", "Highest WAL position confirmed.", flushed_lsn);
-        try appendSimpleGauge(&buf, "zemi_replication_connected", "1 if replication is streaming, 0 if reconnecting.", self.replication_connected.load(.monotonic));
-        try appendSimpleGauge(&buf, "zemi_storage_connected", "1 if storage connection is alive, 0 if reconnecting.", self.storage_connected.load(.monotonic));
-
-        // Uptime
+        const repl_conn = self.replication_connected.load(.monotonic);
+        const stor_conn = self.storage_connected.load(.monotonic);
         const now = std.time.timestamp();
         const uptime: u64 = if (now > self.start_time_secs) @intCast(now - self.start_time_secs) else 0;
-        try appendSimpleGauge(&buf, "zemi_uptime_seconds", "Seconds since process start.", uptime);
+
+        // Emit with both prefixes: zemi_ (canonical) and bemi_ (backward compat).
+        const prefixes = [_][]const u8{ "zemi_", "bemi_" };
+        for (prefixes) |prefix| {
+            try appendCounterPrefixed(&buf, prefix, "changes_processed_total", "Total changes processed.", &[_]LabeledValue{
+                .{ .labels = "operation=\"CREATE\"", .value = created },
+                .{ .labels = "operation=\"UPDATE\"", .value = updated },
+                .{ .labels = "operation=\"DELETE\"", .value = deleted },
+                .{ .labels = "operation=\"TRUNCATE\"", .value = truncated },
+            });
+
+            try appendSimpleCounterPrefixed(&buf, prefix, "changes_filtered_total", "Changes skipped by table filter or feedback-loop filter.", filtered);
+            try appendSimpleCounterPrefixed(&buf, prefix, "changes_duplicated_total", "Changes skipped due to ON CONFLICT deduplication.", duplicated);
+            try appendSimpleCounterPrefixed(&buf, prefix, "transactions_processed_total", "Total committed transactions processed.", transactions);
+            try appendSimpleCounterPrefixed(&buf, prefix, "wal_messages_received_total", "Total WAL messages received.", wal_msgs);
+            try appendSimpleCounterPrefixed(&buf, prefix, "keepalives_received_total", "Total keepalive messages received.", keepalives);
+            try appendSimpleCounterPrefixed(&buf, prefix, "decode_errors_total", "Total decode errors encountered.", decode_errs);
+            try appendSimpleCounterPrefixed(&buf, prefix, "persist_errors_total", "Total persist errors encountered.", persist_errs);
+            try appendSimpleCounterPrefixed(&buf, prefix, "storage_reconnections_total", "Total storage reconnections.", storage_reconns);
+            try appendSimpleCounterPrefixed(&buf, prefix, "replication_reconnections_total", "Total replication reconnections.", repl_reconns);
+
+            // Gauges
+            try appendSimpleGaugePrefixed(&buf, prefix, "replication_lag_bytes", "Replication lag in bytes (received - flushed LSN).", lag);
+            try appendSimpleGaugePrefixed(&buf, prefix, "last_received_lsn", "Highest WAL position received.", received_lsn);
+            try appendSimpleGaugePrefixed(&buf, prefix, "last_flushed_lsn", "Highest WAL position confirmed.", flushed_lsn);
+            try appendSimpleGaugePrefixed(&buf, prefix, "replication_connected", "1 if replication is streaming, 0 if reconnecting.", repl_conn);
+            try appendSimpleGaugePrefixed(&buf, prefix, "storage_connected", "1 if storage connection is alive, 0 if reconnecting.", stor_conn);
+            try appendSimpleGaugePrefixed(&buf, prefix, "uptime_seconds", "Seconds since process start.", uptime);
+        }
 
         return try buf.toOwnedSlice();
     }
@@ -124,6 +143,67 @@ const LabeledValue = struct {
     labels: []const u8,
     value: u64,
 };
+
+fn appendCounterPrefixed(buf: *std.ArrayList(u8), prefix: []const u8, name: []const u8, help: []const u8, labeled_values: []const LabeledValue) !void {
+    try buf.appendSlice("# HELP ");
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice(" ");
+    try buf.appendSlice(help);
+    try buf.append('\n');
+    try buf.appendSlice("# TYPE ");
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice(" counter");
+    try buf.append('\n');
+    for (labeled_values) |lv| {
+        try buf.appendSlice(prefix);
+        try buf.appendSlice(name);
+        try buf.append('{');
+        try buf.appendSlice(lv.labels);
+        try buf.appendSlice("} ");
+        try appendU64(buf, lv.value);
+        try buf.append('\n');
+    }
+}
+
+fn appendSimpleCounterPrefixed(buf: *std.ArrayList(u8), prefix: []const u8, name: []const u8, help: []const u8, value: u64) !void {
+    try buf.appendSlice("# HELP ");
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice(" ");
+    try buf.appendSlice(help);
+    try buf.append('\n');
+    try buf.appendSlice("# TYPE ");
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice(" counter");
+    try buf.append('\n');
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.append(' ');
+    try appendU64(buf, value);
+    try buf.append('\n');
+}
+
+fn appendSimpleGaugePrefixed(buf: *std.ArrayList(u8), prefix: []const u8, name: []const u8, help: []const u8, value: u64) !void {
+    try buf.appendSlice("# HELP ");
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice(" ");
+    try buf.appendSlice(help);
+    try buf.append('\n');
+    try buf.appendSlice("# TYPE ");
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice(" gauge");
+    try buf.append('\n');
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.append(' ');
+    try appendU64(buf, value);
+    try buf.append('\n');
+}
 
 fn appendCounter(buf: *std.ArrayList(u8), name: []const u8, help: []const u8, labeled_values: []const LabeledValue) !void {
     try appendLine(buf, "# HELP ", name, " ", help);
@@ -333,7 +413,7 @@ test "Metrics.render produces Prometheus text format" {
     const output = try m.render(std.testing.allocator);
     defer std.testing.allocator.free(output);
 
-    // Check for expected Prometheus format elements
+    // Check for expected Prometheus format elements (zemi_ prefix)
     try std.testing.expect(std.mem.indexOf(u8, output, "# HELP zemi_changes_processed_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE zemi_changes_processed_total counter") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "zemi_changes_processed_total{operation=\"CREATE\"} 2") != null);
@@ -343,6 +423,15 @@ test "Metrics.render produces Prometheus text format" {
     try std.testing.expect(std.mem.indexOf(u8, output, "zemi_last_received_lsn 1000") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "zemi_last_flushed_lsn 800") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE zemi_uptime_seconds gauge") != null);
+
+    // Check for backward-compatible bemi_ prefix aliases
+    try std.testing.expect(std.mem.indexOf(u8, output, "# HELP bemi_changes_processed_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE bemi_changes_processed_total counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bemi_changes_processed_total{operation=\"CREATE\"} 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bemi_replication_lag_bytes 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bemi_last_received_lsn 1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bemi_last_flushed_lsn 800") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE bemi_uptime_seconds gauge") != null);
 }
 
 test "isMetricsRequest detects /metrics path" {

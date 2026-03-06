@@ -73,14 +73,22 @@ pub const Connection = struct {
         ssl_mode: SslMode,
         ssl_root_cert: ?[]const u8,
     ) ConnectError!Connection {
-        const address = net.Address.resolveIp(host, port) catch |err| {
-            log.err("failed to resolve {s}:{d}: {}", .{ host, port, err });
-            return error.ConnectionRefused;
-        };
-
-        const stream = net.tcpConnectToAddress(address) catch |err| {
-            log.err("failed to connect to {s}:{d}: {}", .{ host, port, err });
-            return error.ConnectionRefused;
+        // Try numeric IP first (no allocation needed), then fall back to
+        // DNS resolution for hostnames like "localhost".
+        const stream = blk: {
+            if (net.Address.resolveIp(host, port)) |address| {
+                break :blk net.tcpConnectToAddress(address) catch |err| {
+                    log.err("failed to connect to {s}:{d}: {}", .{ host, port, err });
+                    return error.ConnectionRefused;
+                };
+            } else |_| {
+                // resolveIp failed (e.g. hostname like "localhost") — use DNS resolution
+                log.debug("resolving hostname {s} via DNS", .{host});
+                break :blk net.tcpConnectToHost(allocator, host, port) catch |err| {
+                    log.err("failed to connect to {s}:{d}: {}", .{ host, port, err });
+                    return error.ConnectionRefused;
+                };
+            }
         };
 
         var conn = Connection{

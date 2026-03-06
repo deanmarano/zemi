@@ -191,6 +191,7 @@ pub const Change = struct {
 pub const NamedValue = struct {
     name: []const u8, // not owned (from relation cache)
     value: ColumnValue, // .text is owned
+    type_oid: u32 = 0, // PostgreSQL type OID from RelationCache (0 = unknown)
 };
 
 fn freeNamedValues(allocator: std.mem.Allocator, nvs: []NamedValue) void {
@@ -819,6 +820,7 @@ pub const Decoder = struct {
             result[i] = .{
                 .name = col_defs[i].name, // owned by RelationCache
                 .value = duped_value,
+                .type_oid = col_defs[i].type_oid,
             };
             initialized = i + 1;
         }

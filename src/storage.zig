@@ -229,11 +229,11 @@ pub const Storage = struct {
             try buf.appendSlice(", ");
 
             // before (JSONB)
-            try appendJsonbLiteral(&buf, change.before);
+            try appendJsonbLiteral(&buf, change.before, self.config.json_type_coercion);
             try buf.appendSlice(", ");
 
             // after (JSONB)
-            try appendJsonbLiteral(&buf, change.after);
+            try appendJsonbLiteral(&buf, change.after, self.config.json_type_coercion);
             try buf.appendSlice(", ");
 
             // context (JSONB) — from _bemi logical message or empty
@@ -323,9 +323,9 @@ pub const Storage = struct {
 
     /// Append a JSONB literal from a slice of NamedValues.
     /// Produces '{"col1": "val1", "col2": null}' etc.
-    fn appendJsonbLiteral(buf: *std.ArrayList(u8), named_values: ?[]const decoder.NamedValue) !void {
+    fn appendJsonbLiteral(buf: *std.ArrayList(u8), named_values: ?[]const decoder.NamedValue, type_coerce: bool) !void {
         try buf.append('\'');
-        try appendJsonObject(buf, named_values);
+        try appendJsonObject(buf, named_values, type_coerce);
         try buf.append('\'');
     }
 
@@ -334,7 +334,16 @@ pub const Storage = struct {
     /// values that PostgreSQL did not send because they weren't modified.
     /// Including them as `null` would be incorrect: consumers couldn't
     /// distinguish "unchanged" from "actually NULL".
-    fn appendJsonObject(buf: *std.ArrayList(u8), named_values: ?[]const decoder.NamedValue) !void {
+    ///
+    /// When `type_coerce` is true, uses the PostgreSQL type OID on each
+    /// NamedValue to emit typed JSON:
+    ///   - int2/int4/int8 (OIDs 21,23,20) → JSON number
+    ///   - float4/float8 (OIDs 700,701) → JSON number
+    ///   - bool (OID 16) → JSON boolean (true/false)
+    ///   - json/jsonb (OIDs 114,3802) → raw embedded JSON
+    ///   - numeric (OID 1700) → JSON string (preserves precision)
+    ///   - everything else → JSON string (current behavior)
+    fn appendJsonObject(buf: *std.ArrayList(u8), named_values: ?[]const decoder.NamedValue, type_coerce: bool) !void {
         const nvs = named_values orelse {
             try buf.appendSlice("{}");
             return;
@@ -349,7 +358,11 @@ pub const Storage = struct {
                     first = false;
                     try appendJsonString(buf, nv.name);
                     try buf.appendSlice(": ");
-                    try appendJsonString(buf, t);
+                    if (type_coerce) {
+                        try appendTypedJsonValue(buf, t, nv.type_oid);
+                    } else {
+                        try appendJsonString(buf, t);
+                    }
                 },
                 .null_value => {
                     if (!first) try buf.appendSlice(", ");
@@ -386,6 +399,110 @@ pub const Storage = struct {
             }
         }
         try buf.append('"');
+    }
+
+    // PostgreSQL type OID constants for type-aware JSON serialization.
+    const OID_BOOL: u32 = 16;
+    const OID_INT2: u32 = 21;
+    const OID_INT4: u32 = 23;
+    const OID_INT8: u32 = 20;
+    const OID_FLOAT4: u32 = 700;
+    const OID_FLOAT8: u32 = 701;
+    const OID_NUMERIC: u32 = 1700;
+    const OID_JSON: u32 = 114;
+    const OID_JSONB: u32 = 3802;
+
+    /// Append a JSON value with type-aware coercion based on PostgreSQL OID.
+    /// Integer/float types are emitted as bare JSON numbers, booleans as
+    /// true/false, json/jsonb as raw embedded JSON, and everything else
+    /// (including numeric, to preserve arbitrary precision) as quoted strings.
+    fn appendTypedJsonValue(buf: *std.ArrayList(u8), text: []const u8, type_oid: u32) !void {
+        switch (type_oid) {
+            OID_BOOL => {
+                // PostgreSQL sends "t" or "f" for booleans
+                if (std.mem.eql(u8, text, "t")) {
+                    try buf.appendSlice("true");
+                } else if (std.mem.eql(u8, text, "f")) {
+                    try buf.appendSlice("false");
+                } else {
+                    // Unexpected value — fall back to string
+                    try appendJsonString(buf, text);
+                }
+            },
+            OID_INT2, OID_INT4, OID_INT8 => {
+                // Validate it looks like an integer before emitting bare
+                if (isValidJsonInteger(text)) {
+                    try buf.appendSlice(text);
+                } else {
+                    try appendJsonString(buf, text);
+                }
+            },
+            OID_FLOAT4, OID_FLOAT8 => {
+                // PostgreSQL can send "NaN", "Infinity", "-Infinity" which
+                // are not valid JSON numbers — quote those as strings.
+                if (isValidJsonNumber(text)) {
+                    try buf.appendSlice(text);
+                } else {
+                    try appendJsonString(buf, text);
+                }
+            },
+            OID_JSON, OID_JSONB => {
+                // Already valid JSON — embed directly
+                try buf.appendSlice(text);
+            },
+            else => {
+                // numeric (1700), text, varchar, timestamps, etc. — quote as string
+                try appendJsonString(buf, text);
+            },
+        }
+    }
+
+    /// Check if a string is a valid JSON integer (optional leading minus, then digits).
+    fn isValidJsonInteger(s: []const u8) bool {
+        if (s.len == 0) return false;
+        var start: usize = 0;
+        if (s[0] == '-') {
+            start = 1;
+            if (s.len == 1) return false; // just "-"
+        }
+        for (s[start..]) |c| {
+            if (c < '0' or c > '9') return false;
+        }
+        return true;
+    }
+
+    /// Check if a string is a valid JSON number (integers, decimals, scientific notation).
+    /// Rejects NaN, Infinity, -Infinity which PostgreSQL can produce.
+    fn isValidJsonNumber(s: []const u8) bool {
+        if (s.len == 0) return false;
+        // Quick reject: NaN, Infinity, -Infinity start with N, I, or -I
+        if (s[0] == 'N' or s[0] == 'I') return false;
+        if (s.len >= 2 and s[0] == '-' and s[1] == 'I') return false;
+
+        var i: usize = 0;
+        if (s[i] == '-') i += 1;
+        if (i >= s.len) return false;
+
+        // Integer part
+        if (s[i] < '0' or s[i] > '9') return false;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+
+        // Fractional part
+        if (i < s.len and s[i] == '.') {
+            i += 1;
+            if (i >= s.len or s[i] < '0' or s[i] > '9') return false;
+            while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+        }
+
+        // Exponent part
+        if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+            i += 1;
+            if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+            if (i >= s.len or s[i] < '0' or s[i] > '9') return false;
+            while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+        }
+
+        return i == s.len;
     }
 
     /// Append a timestamptz literal from PG epoch microseconds.
@@ -453,7 +570,7 @@ test "appendJsonObject produces valid JSON" {
     defer buf.deinit();
 
     // null case
-    try Storage.appendJsonObject(&buf, null);
+    try Storage.appendJsonObject(&buf, null, false);
     try std.testing.expectEqualStrings("{}", buf.items);
 
     buf.clearRetainingCapacity();
@@ -462,7 +579,7 @@ test "appendJsonObject produces valid JSON" {
         .{ .name = "name", .value = .{ .text = "Alice" } },
         .{ .name = "email", .value = .{ .null_value = {} } },
     };
-    try Storage.appendJsonObject(&buf, &nvs);
+    try Storage.appendJsonObject(&buf, &nvs, false);
     try std.testing.expectEqualStrings("{\"id\": \"42\", \"name\": \"Alice\", \"email\": null}", buf.items);
 }
 
@@ -475,7 +592,7 @@ test "appendJsonObject omits unchanged (TOASTed) columns" {
         .{ .name = "bio", .value = .{ .unchanged = {} } }, // TOASTed — should be omitted
         .{ .name = "name", .value = .{ .text = "Alice" } },
     };
-    try Storage.appendJsonObject(&buf, &nvs);
+    try Storage.appendJsonObject(&buf, &nvs, false);
     try std.testing.expectEqualStrings("{\"id\": \"42\", \"name\": \"Alice\"}", buf.items);
 }
 
@@ -488,7 +605,7 @@ test "appendJsonObject omits all unchanged columns" {
         .{ .name = "id", .value = .{ .unchanged = {} } },
         .{ .name = "name", .value = .{ .unchanged = {} } },
     };
-    try Storage.appendJsonObject(&buf, &nvs);
+    try Storage.appendJsonObject(&buf, &nvs, false);
     try std.testing.expectEqualStrings("{}", buf.items);
 }
 
@@ -496,7 +613,7 @@ test "appendJsonbLiteral wraps in single quotes" {
     var buf = std.ArrayList(u8).init(std.testing.allocator);
     defer buf.deinit();
 
-    try Storage.appendJsonbLiteral(&buf, null);
+    try Storage.appendJsonbLiteral(&buf, null, false);
     try std.testing.expectEqualStrings("'{}'", buf.items);
 }
 
@@ -640,4 +757,149 @@ test "buildInsertSql uses empty context when null" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "'{}'") != null);
 
     allocator.free(after_nvs);
+}
+
+test "appendTypedJsonValue emits integers as bare JSON numbers" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    try Storage.appendTypedJsonValue(&buf, "42", Storage.OID_INT4);
+    try std.testing.expectEqualStrings("42", buf.items);
+
+    buf.clearRetainingCapacity();
+    try Storage.appendTypedJsonValue(&buf, "-7", Storage.OID_INT2);
+    try std.testing.expectEqualStrings("-7", buf.items);
+
+    buf.clearRetainingCapacity();
+    try Storage.appendTypedJsonValue(&buf, "9223372036854775807", Storage.OID_INT8);
+    try std.testing.expectEqualStrings("9223372036854775807", buf.items);
+}
+
+test "appendTypedJsonValue emits floats as bare JSON numbers" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    try Storage.appendTypedJsonValue(&buf, "3.14", Storage.OID_FLOAT4);
+    try std.testing.expectEqualStrings("3.14", buf.items);
+
+    buf.clearRetainingCapacity();
+    try Storage.appendTypedJsonValue(&buf, "-0.5", Storage.OID_FLOAT8);
+    try std.testing.expectEqualStrings("-0.5", buf.items);
+}
+
+test "appendTypedJsonValue quotes NaN and Infinity floats" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    try Storage.appendTypedJsonValue(&buf, "NaN", Storage.OID_FLOAT8);
+    try std.testing.expectEqualStrings("\"NaN\"", buf.items);
+
+    buf.clearRetainingCapacity();
+    try Storage.appendTypedJsonValue(&buf, "Infinity", Storage.OID_FLOAT8);
+    try std.testing.expectEqualStrings("\"Infinity\"", buf.items);
+
+    buf.clearRetainingCapacity();
+    try Storage.appendTypedJsonValue(&buf, "-Infinity", Storage.OID_FLOAT4);
+    try std.testing.expectEqualStrings("\"-Infinity\"", buf.items);
+}
+
+test "appendTypedJsonValue emits booleans as true/false" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    try Storage.appendTypedJsonValue(&buf, "t", Storage.OID_BOOL);
+    try std.testing.expectEqualStrings("true", buf.items);
+
+    buf.clearRetainingCapacity();
+    try Storage.appendTypedJsonValue(&buf, "f", Storage.OID_BOOL);
+    try std.testing.expectEqualStrings("false", buf.items);
+}
+
+test "appendTypedJsonValue embeds json/jsonb raw" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    try Storage.appendTypedJsonValue(&buf, "{\"key\": \"value\"}", Storage.OID_JSON);
+    try std.testing.expectEqualStrings("{\"key\": \"value\"}", buf.items);
+
+    buf.clearRetainingCapacity();
+    try Storage.appendTypedJsonValue(&buf, "[1, 2, 3]", Storage.OID_JSONB);
+    try std.testing.expectEqualStrings("[1, 2, 3]", buf.items);
+}
+
+test "appendTypedJsonValue quotes numeric to preserve precision" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    try Storage.appendTypedJsonValue(&buf, "123456789.123456789", Storage.OID_NUMERIC);
+    try std.testing.expectEqualStrings("\"123456789.123456789\"", buf.items);
+}
+
+test "appendTypedJsonValue quotes unknown OIDs as strings" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    // text OID 25
+    try Storage.appendTypedJsonValue(&buf, "hello world", 25);
+    try std.testing.expectEqualStrings("\"hello world\"", buf.items);
+
+    // OID 0 (unknown) — default path
+    buf.clearRetainingCapacity();
+    try Storage.appendTypedJsonValue(&buf, "anything", 0);
+    try std.testing.expectEqualStrings("\"anything\"", buf.items);
+}
+
+test "appendJsonObject with type coercion enabled" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    const nvs = [_]decoder.NamedValue{
+        .{ .name = "id", .value = .{ .text = "42" }, .type_oid = Storage.OID_INT4 },
+        .{ .name = "active", .value = .{ .text = "t" }, .type_oid = Storage.OID_BOOL },
+        .{ .name = "name", .value = .{ .text = "Alice" }, .type_oid = 25 }, // text
+        .{ .name = "score", .value = .{ .text = "3.14" }, .type_oid = Storage.OID_FLOAT8 },
+        .{ .name = "meta", .value = .{ .text = "{\"k\":1}" }, .type_oid = Storage.OID_JSONB },
+        .{ .name = "email", .value = .{ .null_value = {} }, .type_oid = 25 },
+    };
+    try Storage.appendJsonObject(&buf, &nvs, true);
+    try std.testing.expectEqualStrings(
+        "{\"id\": 42, \"active\": true, \"name\": \"Alice\", \"score\": 3.14, \"meta\": {\"k\":1}, \"email\": null}",
+        buf.items,
+    );
+}
+
+test "appendJsonObject without type coercion quotes everything" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    const nvs = [_]decoder.NamedValue{
+        .{ .name = "id", .value = .{ .text = "42" }, .type_oid = Storage.OID_INT4 },
+        .{ .name = "active", .value = .{ .text = "t" }, .type_oid = Storage.OID_BOOL },
+    };
+    try Storage.appendJsonObject(&buf, &nvs, false);
+    try std.testing.expectEqualStrings("{\"id\": \"42\", \"active\": \"t\"}", buf.items);
+}
+
+test "isValidJsonInteger validates correctly" {
+    try std.testing.expect(Storage.isValidJsonInteger("42"));
+    try std.testing.expect(Storage.isValidJsonInteger("-7"));
+    try std.testing.expect(Storage.isValidJsonInteger("0"));
+    try std.testing.expect(!Storage.isValidJsonInteger(""));
+    try std.testing.expect(!Storage.isValidJsonInteger("-"));
+    try std.testing.expect(!Storage.isValidJsonInteger("3.14"));
+    try std.testing.expect(!Storage.isValidJsonInteger("abc"));
+}
+
+test "isValidJsonNumber validates correctly" {
+    try std.testing.expect(Storage.isValidJsonNumber("42"));
+    try std.testing.expect(Storage.isValidJsonNumber("-7"));
+    try std.testing.expect(Storage.isValidJsonNumber("3.14"));
+    try std.testing.expect(Storage.isValidJsonNumber("-0.5"));
+    try std.testing.expect(Storage.isValidJsonNumber("1e10"));
+    try std.testing.expect(Storage.isValidJsonNumber("1.5E-3"));
+    try std.testing.expect(!Storage.isValidJsonNumber("NaN"));
+    try std.testing.expect(!Storage.isValidJsonNumber("Infinity"));
+    try std.testing.expect(!Storage.isValidJsonNumber("-Infinity"));
+    try std.testing.expect(!Storage.isValidJsonNumber(""));
+    try std.testing.expect(!Storage.isValidJsonNumber("abc"));
 }

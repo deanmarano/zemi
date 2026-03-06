@@ -81,6 +81,13 @@ pub const Config = struct {
     // simply won't match any future commit and are harmless duplicates).
     max_transaction_changes: ?u32 = null,
 
+    // JSON type coercion: when true, use PostgreSQL type OIDs to emit
+    // typed JSON values (numbers, booleans, raw JSON) in before/after
+    // JSONB columns instead of quoting everything as strings.
+    // Default false for backward compatibility — existing consumers may
+    // rely on all values being JSON strings.
+    json_type_coercion: bool = false,
+
     /// Returns the effective destination host (falls back to source).
     pub fn getDestHost(self: Config) []const u8 {
         return self.dest_db_host orelse self.db_host;
@@ -225,6 +232,12 @@ pub const Config = struct {
             };
         }
 
+        if (std.posix.getenv("JSON_TYPE_COERCION")) |v| {
+            if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "yes")) {
+                config.json_type_coercion = true;
+            }
+        }
+
         return config;
     }
 
@@ -287,6 +300,9 @@ pub const Config = struct {
         });
         if (self.max_transaction_changes) |limit| {
             log.info("config: max_transaction_changes={d}", .{limit});
+        }
+        if (self.json_type_coercion) {
+            log.info("config: json_type_coercion=true", .{});
         }
         if (self.health_port) |port| {
             log.info("config: health_port={d}", .{port});

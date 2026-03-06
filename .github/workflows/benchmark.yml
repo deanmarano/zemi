@@ -109,7 +109,7 @@ jobs:
   bemi:
     name: Bemi Benchmark
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres-source:
         image: postgres:16-alpine

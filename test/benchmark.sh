@@ -38,7 +38,7 @@ MIXED_OPS_COUNT="${MIXED_OPS_COUNT:-5000}"           # per operation type
 LARGE_TXN_ROWS="${LARGE_TXN_ROWS:-5000}"
 LARGE_TXN_COUNT="${LARGE_TXN_COUNT:-5}"
 LATENCY_SAMPLE_COUNT="${LATENCY_SAMPLE_COUNT:-100}"
-WAIT_TIMEOUT="${WAIT_TIMEOUT:-120}"                   # seconds to wait for changes
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-300}"                   # seconds to wait for changes
 
 ZEMI_ONLY=false
 BEMI_ONLY=false

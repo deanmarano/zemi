@@ -278,11 +278,13 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
 
         if (xlog) |data| {
             // Decode the pgoutput message; returns changes on Commit or early flush
+            var decode_timer = std.time.Timer.start() catch unreachable;
             const result = dec.decode(data.data, data.wal_start) catch |err| {
                 log.warn("decode error: {}, skipping message", .{err});
                 Metrics.inc(&m.decode_errors_total);
                 continue;
             };
+            m.decode_duration_seconds.observeNanos(decode_timer.read());
 
             const changes: ?[]decoder.Change = switch (result) {
                 .commit => |c| c,
@@ -326,12 +328,14 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
                 }
 
                 // Persist the transaction's changes to the changes table
+                var persist_timer = std.time.Timer.start() catch unreachable;
                 const inserted = storage.persistChanges(filtered.items) catch |err| {
                     log.err("failed to persist {d} changes: {}", .{ filtered.items.len, err });
                     Metrics.inc(&m.persist_errors_total);
                     // Don't confirm LSN — changes will be replayed on reconnect
                     continue;
                 };
+                m.persist_duration_seconds.observeNanos(persist_timer.read());
 
                 tx_count += 1;
                 changes_count += filtered.items.len;

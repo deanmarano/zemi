@@ -4,6 +4,47 @@ const net = std.net;
 
 const log = std.log.scoped(.metrics);
 
+// Standard Prometheus histogram bucket boundaries (in seconds).
+// These are cumulative: each bucket counts observations <= boundary.
+const histogram_boundaries = [_]f64{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 };
+const num_buckets = histogram_boundaries.len;
+
+/// A thread-safe Prometheus histogram with fixed exponential buckets.
+/// Uses atomic counters for lock-free concurrent access.
+/// Bucket boundaries are defined at comptime (histogram_boundaries).
+pub const Histogram = struct {
+    /// Cumulative bucket counters: bucket[i] counts observations <= histogram_boundaries[i].
+    buckets: [num_buckets]std.atomic.Value(u64),
+    /// Total count of observations (+Inf bucket).
+    count: std.atomic.Value(u64),
+    /// Sum of all observed values, stored as microseconds (u64) to avoid float atomics.
+    sum_usec: std.atomic.Value(u64),
+
+    pub fn init() Histogram {
+        var h: Histogram = undefined;
+        for (&h.buckets) |*b| {
+            b.* = std.atomic.Value(u64).init(0);
+        }
+        h.count = std.atomic.Value(u64).init(0);
+        h.sum_usec = std.atomic.Value(u64).init(0);
+        return h;
+    }
+
+    /// Observe a duration in nanoseconds (from std.time.Timer).
+    pub fn observeNanos(self: *Histogram, nanos: u64) void {
+        const usec = nanos / 1_000; // convert to microseconds
+        const seconds = @as(f64, @floatFromInt(nanos)) / 1_000_000_000.0;
+        // Increment all cumulative buckets where value <= boundary
+        for (&self.buckets, 0..) |*bucket, i| {
+            if (seconds <= histogram_boundaries[i]) {
+                _ = bucket.fetchAdd(1, .monotonic);
+            }
+        }
+        _ = self.count.fetchAdd(1, .monotonic);
+        _ = self.sum_usec.fetchAdd(usec, .monotonic);
+    }
+};
+
 /// Thread-safe Prometheus metrics for Zemi.
 ///
 /// All counters use `std.atomic.Value(u64)` with `.monotonic` ordering,
@@ -70,6 +111,14 @@ pub const Metrics = struct {
 
     /// Process start time (Unix timestamp in seconds), set once at init.
     start_time_secs: i64 = 0,
+
+    // --- Histograms (latency distributions) ---
+
+    /// Duration of persistChanges() calls in seconds.
+    persist_duration_seconds: Histogram = Histogram.init(),
+
+    /// Duration of decode() calls in seconds (per WAL message).
+    decode_duration_seconds: Histogram = Histogram.init(),
 
     // --- Helpers ---
 
@@ -148,6 +197,10 @@ pub const Metrics = struct {
             try appendSimpleGaugePrefixed(&buf, prefix, "replication_connected", "1 if replication is streaming, 0 if reconnecting.", repl_conn);
             try appendSimpleGaugePrefixed(&buf, prefix, "storage_connected", "1 if storage connection is alive, 0 if reconnecting.", stor_conn);
             try appendSimpleGaugePrefixed(&buf, prefix, "uptime_seconds", "Seconds since process start.", uptime);
+
+            // Histograms
+            try appendHistogramPrefixed(&buf, prefix, "persist_duration_seconds", "Duration of persist operations in seconds.", &self.persist_duration_seconds);
+            try appendHistogramPrefixed(&buf, prefix, "decode_duration_seconds", "Duration of decode operations in seconds.", &self.decode_duration_seconds);
         }
 
         return try buf.toOwnedSlice();
@@ -263,6 +316,74 @@ fn appendU64(buf: *std.ArrayList(u8), value: u64) !void {
     var num_buf: [20]u8 = undefined;
     const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{value}) catch unreachable;
     try buf.appendSlice(num_str);
+}
+
+fn appendFloat(buf: *std.ArrayList(u8), value: f64) !void {
+    var num_buf: [32]u8 = undefined;
+    const num_str = std.fmt.bufPrint(&num_buf, "{d:.6}", .{value}) catch unreachable;
+    try buf.appendSlice(num_str);
+}
+
+/// Render a Prometheus histogram with the given prefix.
+/// Format:
+///   # HELP {prefix}{name} {help}
+///   # TYPE {prefix}{name} histogram
+///   {prefix}{name}_bucket{le="0.001"} N
+///   ...
+///   {prefix}{name}_bucket{le="+Inf"} N
+///   {prefix}{name}_sum N.NNNNNN
+///   {prefix}{name}_count N
+fn appendHistogramPrefixed(buf: *std.ArrayList(u8), prefix: []const u8, name: []const u8, help: []const u8, h: *const Histogram) !void {
+    // HELP / TYPE
+    try buf.appendSlice("# HELP ");
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice(" ");
+    try buf.appendSlice(help);
+    try buf.append('\n');
+    try buf.appendSlice("# TYPE ");
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice(" histogram");
+    try buf.append('\n');
+
+    // Bucket lines
+    const count = h.count.load(.monotonic);
+    for (h.buckets, 0..) |bucket, i| {
+        const bucket_count = bucket.load(.monotonic);
+        try buf.appendSlice(prefix);
+        try buf.appendSlice(name);
+        try buf.appendSlice("_bucket{le=\"");
+        var le_buf: [16]u8 = undefined;
+        const le_str = std.fmt.bufPrint(&le_buf, "{d}", .{histogram_boundaries[i]}) catch unreachable;
+        try buf.appendSlice(le_str);
+        try buf.appendSlice("\"} ");
+        try appendU64(buf, bucket_count);
+        try buf.append('\n');
+    }
+
+    // +Inf bucket (always equals count)
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice("_bucket{le=\"+Inf\"} ");
+    try appendU64(buf, count);
+    try buf.append('\n');
+
+    // Sum (convert from microseconds to seconds)
+    const sum_usec = h.sum_usec.load(.monotonic);
+    const sum_seconds = @as(f64, @floatFromInt(sum_usec)) / 1_000_000.0;
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice("_sum ");
+    try appendFloat(buf, sum_seconds);
+    try buf.append('\n');
+
+    // Count
+    try buf.appendSlice(prefix);
+    try buf.appendSlice(name);
+    try buf.appendSlice("_count ");
+    try appendU64(buf, count);
+    try buf.append('\n');
 }
 
 // ============================================================================
@@ -504,4 +625,68 @@ test "Metrics.render includes replication error counters" {
     try std.testing.expect(std.mem.indexOf(u8, output, "zemi_replication_permanent_errors_total 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "bemi_replication_transient_errors_total 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "bemi_replication_permanent_errors_total 1") != null);
+}
+
+test "Histogram.observeNanos buckets and counts correctly" {
+    var h = Histogram.init();
+
+    // Observe 500 microseconds = 0.0005 seconds (should land in 0.001 bucket and above)
+    h.observeNanos(500_000); // 500us
+
+    try std.testing.expectEqual(@as(u64, 1), h.count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 500), h.sum_usec.load(.monotonic));
+    // 0.0005s <= 0.001, so bucket[0] (le=0.001) should be 1
+    try std.testing.expectEqual(@as(u64, 1), h.buckets[0].load(.monotonic));
+    // All higher buckets should also be 1 (cumulative)
+    try std.testing.expectEqual(@as(u64, 1), h.buckets[5].load(.monotonic)); // le=0.1
+    try std.testing.expectEqual(@as(u64, 1), h.buckets[11].load(.monotonic)); // le=10.0
+
+    // Observe 50 milliseconds = 0.05 seconds (bucket[4]=0.05 and above, but NOT bucket[3]=0.025)
+    h.observeNanos(50_000_000); // 50ms
+
+    try std.testing.expectEqual(@as(u64, 2), h.count.load(.monotonic));
+    // bucket[3] (le=0.025): only the first observation fits
+    try std.testing.expectEqual(@as(u64, 1), h.buckets[3].load(.monotonic));
+    // bucket[4] (le=0.05): both observations fit
+    try std.testing.expectEqual(@as(u64, 2), h.buckets[4].load(.monotonic));
+
+    // Observe 15 seconds (exceeds all bucket boundaries)
+    h.observeNanos(15_000_000_000); // 15s
+
+    try std.testing.expectEqual(@as(u64, 3), h.count.load(.monotonic));
+    // le=10.0 bucket should only have the first two observations
+    try std.testing.expectEqual(@as(u64, 2), h.buckets[11].load(.monotonic));
+}
+
+test "Metrics.render includes histogram output" {
+    var m = Metrics{ .start_time_secs = std.time.timestamp() };
+
+    // Observe a 1ms decode (1_000_000 nanos)
+    m.decode_duration_seconds.observeNanos(1_000_000);
+
+    const output = try m.render(std.testing.allocator);
+    defer std.testing.allocator.free(output);
+
+    // Check histogram HELP/TYPE lines
+    try std.testing.expect(std.mem.indexOf(u8, output, "# HELP zemi_decode_duration_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE zemi_decode_duration_seconds histogram") != null);
+
+    // Check bucket lines — 1ms = 0.001s, so le="0.001" bucket should have 1
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_decode_duration_seconds_bucket{le=\"0.001\"} 1") != null);
+    // Higher buckets should also have 1
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_decode_duration_seconds_bucket{le=\"10\"} 1") != null);
+    // +Inf bucket
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_decode_duration_seconds_bucket{le=\"+Inf\"} 1") != null);
+    // Count
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_decode_duration_seconds_count 1") != null);
+    // Sum: 1ms = 1000 usec = 0.001000 seconds
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_decode_duration_seconds_sum 0.001000") != null);
+
+    // Check persist histogram exists (empty)
+    try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE zemi_persist_duration_seconds histogram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_persist_duration_seconds_count 0") != null);
+
+    // Check bemi_ backward compat
+    try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE bemi_decode_duration_seconds histogram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bemi_decode_duration_seconds_bucket{le=\"+Inf\"} 1") != null);
 }

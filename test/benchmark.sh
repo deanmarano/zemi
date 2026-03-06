@@ -163,6 +163,38 @@ reset_tables() {
   psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" > /dev/null 2>&1 || true
 }
 
+# Verify a tracker is actually streaming by inserting a canary row and waiting for it
+verify_tracker_streaming() {
+  local tracker="$1"
+  local timeout_secs="${2:-30}"
+  log "[$tracker] Verifying tracker is streaming (canary insert)..."
+
+  # Insert a canary row
+  psql_source -c "INSERT INTO bench_items (name, value) VALUES ('__canary__', 0);" > /dev/null
+
+  # Wait for the canary to appear in the changes table
+  local waited=0
+  while [[ $waited -lt $timeout_secs ]]; do
+    local found
+    found=$(psql_dest -c "SELECT COUNT(*) FROM changes WHERE \"table\" = 'bench_items' AND operation != 'TRUNCATE' AND after::text LIKE '%__canary__%';" 2>/dev/null || echo "0")
+    found="${found//[[:space:]]/}"
+    if [[ "$found" -ge 1 ]]; then
+      ok "[$tracker] Tracker is streaming (canary detected in ${waited}s)"
+      # Clean up canary row and reset for benchmarks
+      psql_source -c "TRUNCATE bench_items RESTART IDENTITY;" > /dev/null
+      # Wait for TRUNCATE WAL event to propagate, then wipe dest changes
+      sleep 2
+      psql_dest -c "DELETE FROM changes WHERE \"table\" = 'bench_items';" > /dev/null 2>&1 || true
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  err "[$tracker] Tracker is NOT streaming after ${timeout_secs}s — canary not detected"
+  return 1
+}
+
 # Wait until the expected number of non-TRUNCATE changes appear in the destination.
 # TRUNCATE operations from reset_tables() are excluded to avoid off-by-one races.
 # Returns the elapsed time in milliseconds.

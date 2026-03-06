@@ -1,11 +1,13 @@
 const std = @import("std");
 const posix = std.posix;
 const net = std.net;
+const Metrics = @import("metrics.zig").Metrics;
 
 const log = std.log.scoped(.health);
 
 /// Minimal TCP health check server for container orchestration.
-/// Accepts connections and responds with "HTTP/1.1 200 OK\r\n\r\nok\n".
+/// When metrics are available, checks replication and storage connection
+/// state and returns HTTP 503 if either is down.
 /// Runs in a background thread. Heap-allocated so the thread's pointer
 /// remains valid after start() returns.
 pub const HealthServer = struct {
@@ -14,10 +16,15 @@ pub const HealthServer = struct {
     should_stop: std.atomic.Value(bool),
     bound_port: u16,
     allocator: std.mem.Allocator,
+    metrics: ?*const Metrics,
 
-    const http_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
+    const http_ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\",\"replication\":true,\"storage\":true}\n";
+    const http_degraded_repl = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"unhealthy\",\"replication\":false,\"storage\":true}\n";
+    const http_degraded_stor = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"unhealthy\",\"replication\":true,\"storage\":false}\n";
+    const http_degraded_both = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"unhealthy\",\"replication\":false,\"storage\":false}\n";
+    const http_ok_simple = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
 
-    pub fn start(port: u16, allocator: std.mem.Allocator) !*HealthServer {
+    pub fn start(port: u16, allocator: std.mem.Allocator, metrics: ?*const Metrics) !*HealthServer {
         const addr = net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
         const server_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer posix.close(server_fd);
@@ -43,6 +50,7 @@ pub const HealthServer = struct {
             .should_stop = std.atomic.Value(bool).init(false),
             .bound_port = bound_port,
             .allocator = allocator,
+            .metrics = metrics,
         };
 
         hs.thread = try std.Thread.spawn(.{}, acceptLoop, .{hs});
@@ -64,6 +72,19 @@ pub const HealthServer = struct {
         self.allocator.destroy(self);
     }
 
+    fn getHealthResponse(self: *const HealthServer) []const u8 {
+        if (self.metrics) |m| {
+            const repl_ok = m.replication_connected.load(.monotonic) == 1;
+            const stor_ok = m.storage_connected.load(.monotonic) == 1;
+            if (repl_ok and stor_ok) return http_ok;
+            if (!repl_ok and stor_ok) return http_degraded_repl;
+            if (repl_ok and !stor_ok) return http_degraded_stor;
+            return http_degraded_both;
+        }
+        // No metrics available — return simple OK (backward compatible)
+        return http_ok_simple;
+    }
+
     fn acceptLoop(self: *HealthServer) void {
         while (!self.should_stop.load(.acquire)) {
             // Use raw C accept to avoid Zig's unreachable assertions on NOTSOCK/BADF
@@ -76,8 +97,9 @@ pub const HealthServer = struct {
                 break;
             }
 
+            const response = self.getHealthResponse();
             const stream = std.net.Stream{ .handle = client_fd };
-            stream.writeAll(http_response) catch {};
+            stream.writeAll(response) catch {};
             posix.close(client_fd);
         }
     }
@@ -87,8 +109,61 @@ pub const HealthServer = struct {
 // Tests
 // ============================================================================
 
-test "http_response is well-formed" {
-    const resp = HealthServer.http_response;
-    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK"));
-    try std.testing.expect(std.mem.indexOf(u8, resp, "ok\n") != null);
+test "http responses are well-formed" {
+    // OK response
+    try std.testing.expect(std.mem.startsWith(u8, HealthServer.http_ok, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.indexOf(u8, HealthServer.http_ok, "\"status\":\"ok\"") != null);
+
+    // Degraded responses
+    try std.testing.expect(std.mem.startsWith(u8, HealthServer.http_degraded_repl, "HTTP/1.1 503"));
+    try std.testing.expect(std.mem.indexOf(u8, HealthServer.http_degraded_repl, "\"replication\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, HealthServer.http_degraded_repl, "\"storage\":true") != null);
+
+    try std.testing.expect(std.mem.startsWith(u8, HealthServer.http_degraded_stor, "HTTP/1.1 503"));
+    try std.testing.expect(std.mem.indexOf(u8, HealthServer.http_degraded_stor, "\"replication\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, HealthServer.http_degraded_stor, "\"storage\":false") != null);
+
+    // Simple OK (no metrics)
+    try std.testing.expect(std.mem.startsWith(u8, HealthServer.http_ok_simple, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.indexOf(u8, HealthServer.http_ok_simple, "ok\n") != null);
+}
+
+test "getHealthResponse reflects metrics state" {
+    var m = Metrics{ .start_time_secs = 0 };
+
+    // Both disconnected initially
+    const hs_stack = HealthServer{
+        .thread = undefined,
+        .server_fd = 0,
+        .should_stop = std.atomic.Value(bool).init(false),
+        .bound_port = 0,
+        .allocator = std.testing.allocator,
+        .metrics = &m,
+    };
+
+    // Both disconnected (initial state = 0)
+    try std.testing.expectEqualStrings(HealthServer.http_degraded_both, hs_stack.getHealthResponse());
+
+    // Replication connected, storage still down
+    Metrics.set(&m.replication_connected, 1);
+    try std.testing.expectEqualStrings(HealthServer.http_degraded_stor, hs_stack.getHealthResponse());
+
+    // Both connected
+    Metrics.set(&m.storage_connected, 1);
+    try std.testing.expectEqualStrings(HealthServer.http_ok, hs_stack.getHealthResponse());
+
+    // Replication down, storage up
+    Metrics.set(&m.replication_connected, 0);
+    try std.testing.expectEqualStrings(HealthServer.http_degraded_repl, hs_stack.getHealthResponse());
+
+    // No metrics = simple ok
+    const hs_no_metrics = HealthServer{
+        .thread = undefined,
+        .server_fd = 0,
+        .should_stop = std.atomic.Value(bool).init(false),
+        .bound_port = 0,
+        .allocator = std.testing.allocator,
+        .metrics = null,
+    };
+    try std.testing.expectEqualStrings(HealthServer.http_ok_simple, hs_no_metrics.getHealthResponse());
 }

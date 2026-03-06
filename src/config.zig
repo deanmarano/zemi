@@ -74,6 +74,10 @@ pub const Config = struct {
     metrics_port: ?u16 = null, // null = metrics endpoint disabled
     cleanup_on_shutdown: bool = false, // drop slot + publication on graceful shutdown
 
+    // Timeout settings (seconds). 0 = no timeout (default).
+    connect_timeout_secs: u32 = 0,
+    query_timeout_secs: u32 = 0,
+
     // Large transaction handling: flush accumulated changes to storage
     // mid-transaction when this limit is exceeded. null = unlimited (default).
     // Changes are idempotent via ON CONFLICT DO NOTHING, so early flushes
@@ -225,6 +229,20 @@ pub const Config = struct {
             }
         }
 
+        if (std.posix.getenv("CONNECT_TIMEOUT")) |v| {
+            config.connect_timeout_secs = std.fmt.parseUnsigned(u32, v, 10) catch blk: {
+                log.warn("invalid CONNECT_TIMEOUT '{s}', using default 0 (no timeout)", .{v});
+                break :blk 0;
+            };
+        }
+
+        if (std.posix.getenv("QUERY_TIMEOUT")) |v| {
+            config.query_timeout_secs = std.fmt.parseUnsigned(u32, v, 10) catch blk: {
+                log.warn("invalid QUERY_TIMEOUT '{s}', using default 0 (no timeout)", .{v});
+                break :blk 0;
+            };
+        }
+
         if (std.posix.getenv("MAX_TRANSACTION_CHANGES")) |v| {
             config.max_transaction_changes = std.fmt.parseUnsigned(u32, v, 10) catch blk: {
                 log.warn("invalid MAX_TRANSACTION_CHANGES '{s}', disabling limit", .{v});
@@ -248,8 +266,53 @@ pub const Config = struct {
         if (self.db_name.len == 0) return "DB_NAME must not be empty";
         if (self.db_user.len == 0) return "DB_USER must not be empty";
         if (self.slot_name.len == 0) return "SLOT_NAME must not be empty";
+        if (!isValidIdentifier(self.slot_name)) return "SLOT_NAME must be a valid SQL identifier (letters, digits, underscores; must start with a letter or underscore; max 63 chars)";
         if (self.publication_name.len == 0) return "PUBLICATION_NAME must not be empty";
+        if (!isValidIdentifier(self.publication_name)) return "PUBLICATION_NAME must be a valid SQL identifier (letters, digits, underscores; must start with a letter or underscore; max 63 chars)";
         if (self.shutdown_timeout_secs == 0) return "SHUTDOWN_TIMEOUT must be > 0";
+        // Validate table names if TABLES is set (these go into SQL statements)
+        if (self.tables) |tables_str| {
+            if (validateTableNames(tables_str)) |err_msg| return err_msg;
+        }
+        return null;
+    }
+
+    /// Check if a string is a valid PostgreSQL identifier: starts with a letter
+    /// or underscore, followed by letters, digits, or underscores. Max 63 chars.
+    /// This prevents SQL injection when interpolating names into DDL statements.
+    pub fn isValidIdentifier(name: []const u8) bool {
+        if (name.len == 0 or name.len > 63) return false;
+        const first = name[0];
+        if (!std.ascii.isAlphabetic(first) and first != '_') return false;
+        for (name[1..]) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+        }
+        return true;
+    }
+
+    /// Validate all table names in a comma-separated TABLES string.
+    /// Each entry must be a valid identifier, or optionally schema-qualified
+    /// (schema.table where both parts are valid identifiers).
+    /// Returns an error message if invalid, null if all are valid.
+    fn validateTableNames(tables_str: []const u8) ?[]const u8 {
+        var iter = std.mem.splitScalar(u8, tables_str, ',');
+        while (iter.next()) |entry| {
+            const trimmed = std.mem.trim(u8, entry, " \t");
+            if (trimmed.len == 0) continue;
+
+            // Allow schema.table or just table
+            if (std.mem.indexOfScalar(u8, trimmed, '.')) |dot_pos| {
+                const schema_part = trimmed[0..dot_pos];
+                const table_part = trimmed[dot_pos + 1 ..];
+                if (!isValidIdentifier(schema_part) or !isValidIdentifier(table_part)) {
+                    return "TABLES contains an invalid table name (must be valid SQL identifiers, e.g. 'users' or 'public.users')";
+                }
+            } else {
+                if (!isValidIdentifier(trimmed)) {
+                    return "TABLES contains an invalid table name (must be valid SQL identifiers, e.g. 'users' or 'public.users')";
+                }
+            }
+        }
         return null;
     }
 
@@ -310,6 +373,12 @@ pub const Config = struct {
         if (self.metrics_port) |port| {
             log.info("config: metrics_port={d}", .{port});
         }
+        if (self.connect_timeout_secs > 0) {
+            log.info("config: connect_timeout={d}s", .{self.connect_timeout_secs});
+        }
+        if (self.query_timeout_secs > 0) {
+            log.info("config: query_timeout={d}s", .{self.query_timeout_secs});
+        }
     }
 };
 
@@ -355,6 +424,68 @@ test "validate catches empty required fields" {
     }
     {
         const config = Config{ .shutdown_timeout_secs = 0 };
+        try std.testing.expect(config.validate() != null);
+    }
+}
+
+test "validate rejects invalid slot and publication names" {
+    // SQL injection attempts
+    {
+        const config = Config{ .slot_name = "slot; DROP TABLE users" };
+        try std.testing.expect(config.validate() != null);
+    }
+    {
+        const config = Config{ .publication_name = "pub' OR '1'='1" };
+        try std.testing.expect(config.validate() != null);
+    }
+    // Names starting with digits
+    {
+        const config = Config{ .slot_name = "123slot" };
+        try std.testing.expect(config.validate() != null);
+    }
+    // Names with special characters
+    {
+        const config = Config{ .slot_name = "my-slot" };
+        try std.testing.expect(config.validate() != null);
+    }
+    // Valid names pass
+    {
+        const config = Config{ .slot_name = "my_slot_123", .publication_name = "_pub" };
+        try std.testing.expect(config.validate() == null);
+    }
+}
+
+test "isValidIdentifier" {
+    try std.testing.expect(Config.isValidIdentifier("bemi"));
+    try std.testing.expect(Config.isValidIdentifier("_private"));
+    try std.testing.expect(Config.isValidIdentifier("slot_123"));
+    try std.testing.expect(Config.isValidIdentifier("A"));
+    try std.testing.expect(!Config.isValidIdentifier(""));
+    try std.testing.expect(!Config.isValidIdentifier("123abc"));
+    try std.testing.expect(!Config.isValidIdentifier("my-name"));
+    try std.testing.expect(!Config.isValidIdentifier("has space"));
+    try std.testing.expect(!Config.isValidIdentifier("semi;colon"));
+    try std.testing.expect(!Config.isValidIdentifier("quote'mark"));
+    // 63 chars is ok, 64 is not
+    try std.testing.expect(Config.isValidIdentifier("a" ** 63));
+    try std.testing.expect(!Config.isValidIdentifier("a" ** 64));
+}
+
+test "validate rejects invalid table names in TABLES" {
+    {
+        const config = Config{ .tables = "users; DROP TABLE foo" };
+        try std.testing.expect(config.validate() != null);
+    }
+    {
+        const config = Config{ .tables = "users,orders" };
+        try std.testing.expect(config.validate() == null);
+    }
+    {
+        const config = Config{ .tables = "public.users, myschema.orders" };
+        try std.testing.expect(config.validate() == null);
+    }
+    {
+        const config = Config{ .tables = "public.users, bad;table" };
         try std.testing.expect(config.validate() != null);
     }
 }

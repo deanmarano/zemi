@@ -40,6 +40,8 @@ pub const ReplicationStream = struct {
             "database", // replication=database
             config.db_ssl_mode,
             config.db_ssl_root_cert,
+            config.connect_timeout_secs,
+            0, // no query timeout for replication connections
         ) catch |err| {
             log.err("failed to open replication connection: {}", .{err});
             return err;
@@ -255,6 +257,8 @@ pub const ReplicationStream = struct {
 
 /// Connect to PostgreSQL as a normal (non-replication) client.
 /// Used for setup queries like creating publications.
+/// When config.tables is set, creates a publication for only those tables
+/// (server-side filtering). Otherwise, creates a publication for all tables.
 pub fn ensurePublication(allocator: std.mem.Allocator, config: Config) !void {
     var conn = try Connection.connect(
         allocator,
@@ -266,20 +270,73 @@ pub fn ensurePublication(allocator: std.mem.Allocator, config: Config) !void {
         null, // normal connection
         config.db_ssl_mode,
         config.db_ssl_root_cert,
+        config.connect_timeout_secs,
+        config.query_timeout_secs,
     );
     defer conn.close();
 
-    // Create publication if it doesn't exist
-    var buf: [256]u8 = undefined;
-    const sql = std.fmt.bufPrint(&buf, "CREATE PUBLICATION {s} FOR ALL TABLES", .{
-        config.publication_name,
-    }) catch return error.ServerError;
+    if (config.tables) |tables_str| {
+        // Build the table list for the publication (e.g. "users, orders, products")
+        const table_list = try buildPublicationTableList(allocator, tables_str);
+        defer allocator.free(table_list);
 
-    conn.exec(sql) catch {
-        log.info("publication '{s}' may already exist, continuing", .{config.publication_name});
-    };
+        // Try CREATE PUBLICATION ... FOR TABLE ...
+        const create_sql = try std.fmt.allocPrint(allocator, "CREATE PUBLICATION {s} FOR TABLE {s}", .{
+            config.publication_name, table_list,
+        });
+        defer allocator.free(create_sql);
 
-    log.info("publication '{s}' ready", .{config.publication_name});
+        conn.exec(create_sql) catch {
+            // Publication may already exist — update its table list
+            log.info("publication '{s}' may already exist, updating table list", .{config.publication_name});
+            const alter_sql = std.fmt.allocPrint(allocator, "ALTER PUBLICATION {s} SET TABLE {s}", .{
+                config.publication_name, table_list,
+            }) catch return error.ServerError;
+            defer allocator.free(alter_sql);
+
+            conn.exec(alter_sql) catch |alter_err| {
+                log.err("failed to alter publication '{s}': {}", .{ config.publication_name, alter_err });
+                return alter_err;
+            };
+        };
+
+        log.info("publication '{s}' ready (tables: {s})", .{ config.publication_name, table_list });
+    } else {
+        // No table filter — publish all tables
+        var buf: [256]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buf, "CREATE PUBLICATION {s} FOR ALL TABLES", .{
+            config.publication_name,
+        }) catch return error.ServerError;
+
+        conn.exec(sql) catch {
+            log.info("publication '{s}' may already exist, continuing", .{config.publication_name});
+        };
+
+        log.info("publication '{s}' ready (all tables)", .{config.publication_name});
+    }
+}
+
+/// Build a comma-separated table list suitable for CREATE/ALTER PUBLICATION.
+/// Input: "users, orders , products"
+/// Output: "users, orders, products" (trimmed, validated non-empty)
+fn buildPublicationTableList(allocator: std.mem.Allocator, tables_str: []const u8) ![]u8 {
+    var result = std.ArrayList(u8).init(allocator);
+    errdefer result.deinit();
+
+    var first = true;
+    var iter = std.mem.splitScalar(u8, tables_str, ',');
+    while (iter.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t");
+        if (trimmed.len == 0) continue;
+
+        if (!first) {
+            try result.appendSlice(", ");
+        }
+        try result.appendSlice(trimmed);
+        first = false;
+    }
+
+    return result.toOwnedSlice();
 }
 
 /// Drop the publication. Uses a normal (non-replication) connection.
@@ -295,6 +352,8 @@ pub fn dropPublication(allocator: std.mem.Allocator, config: Config) void {
         null, // normal connection
         config.db_ssl_mode,
         config.db_ssl_root_cert,
+        config.connect_timeout_secs,
+        config.query_timeout_secs,
     ) catch |err| {
         log.warn("failed to connect for publication cleanup: {}", .{err});
         return;
@@ -330,6 +389,8 @@ pub fn dropSlot(allocator: std.mem.Allocator, config: Config) void {
         null, // normal connection
         config.db_ssl_mode,
         config.db_ssl_root_cert,
+        config.connect_timeout_secs,
+        config.query_timeout_secs,
     ) catch |err| {
         log.warn("failed to connect for slot cleanup: {}", .{err});
         return;
@@ -350,4 +411,48 @@ pub fn dropSlot(allocator: std.mem.Allocator, config: Config) void {
     };
 
     log.info("dropped replication slot '{s}'", .{config.slot_name});
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "buildPublicationTableList parses comma-separated tables" {
+    const allocator = std.testing.allocator;
+
+    {
+        const result = try buildPublicationTableList(allocator, "users,orders,products");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("users, orders, products", result);
+    }
+}
+
+test "buildPublicationTableList trims whitespace" {
+    const allocator = std.testing.allocator;
+
+    {
+        const result = try buildPublicationTableList(allocator, " users , orders , products ");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("users, orders, products", result);
+    }
+}
+
+test "buildPublicationTableList handles single table" {
+    const allocator = std.testing.allocator;
+
+    {
+        const result = try buildPublicationTableList(allocator, "users");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("users", result);
+    }
+}
+
+test "buildPublicationTableList skips empty entries" {
+    const allocator = std.testing.allocator;
+
+    {
+        const result = try buildPublicationTableList(allocator, "users,,orders,");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("users, orders", result);
+    }
 }

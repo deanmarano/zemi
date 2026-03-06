@@ -790,9 +790,13 @@ pub const Decoder = struct {
     }
 
     /// Extract primary key text and return an owned copy.
+    /// For composite primary keys, concatenates all key column values with commas.
     fn dupeExtractPrimaryKey(self: *Decoder, col_defs: []const ColumnDef, col_values: []const ColumnValue) ![]const u8 {
-        const pk = extractPrimaryKey(col_defs, col_values);
-        return try self.allocator.dupe(u8, pk);
+        const pk = extractPrimaryKey(self.allocator, col_defs, col_values);
+        switch (pk) {
+            .single => |s| return try self.allocator.dupe(u8, s),
+            .composite => |owned| return owned, // already heap-allocated
+        }
     }
 
     /// Build named values with owned (duped) text values.
@@ -832,26 +836,69 @@ pub const Decoder = struct {
 // Helper functions (non-owning, for parsing layer)
 // ============================================================================
 
-/// Extract the primary key value from tuple data (non-owning).
-/// Uses the first column marked as part of the replica identity key.
-/// Returns the text value or "" if not found.
-fn extractPrimaryKey(col_defs: []const ColumnDef, col_values: []const ColumnValue) []const u8 {
+/// Result of extractPrimaryKey: either a non-owning slice (single key)
+/// or a heap-allocated composite key string.
+const PrimaryKeyResult = union(enum) {
+    /// Single key column — borrows from the parse buffer (caller must dupe if needed)
+    single: []const u8,
+    /// Composite key — heap-allocated, caller owns
+    composite: []const u8,
+};
+
+/// Extract the primary key value(s) from tuple data.
+/// For single-column PKs, returns the text value (non-owning).
+/// For composite PKs, returns all key values joined by commas (heap-allocated).
+/// Falls back to the first column if no key columns are found.
+fn extractPrimaryKey(allocator: std.mem.Allocator, col_defs: []const ColumnDef, col_values: []const ColumnValue) PrimaryKeyResult {
+    // First pass: count key columns and find their text values
+    var key_count: usize = 0;
+    var first_key_text: ?[]const u8 = null;
     for (col_defs, 0..) |col, i| {
         if (col.isKey() and i < col_values.len) {
             switch (col_values[i]) {
-                .text => |t| return t,
-                else => {},
+                .text => |t| {
+                    if (key_count == 0) first_key_text = t;
+                    key_count += 1;
+                },
+                else => {
+                    key_count += 1;
+                },
             }
         }
     }
-    // Fallback: use first column if it has a text value
-    if (col_values.len > 0) {
-        switch (col_values[0]) {
-            .text => |t| return t,
-            else => {},
+
+    // Single key column — return non-owning slice (most common case)
+    if (key_count == 1) {
+        if (first_key_text) |t| return .{ .single = t };
+        return .{ .single = "" };
+    }
+
+    // No key columns — fallback to first column
+    if (key_count == 0) {
+        if (col_values.len > 0) {
+            switch (col_values[0]) {
+                .text => |t| return .{ .single = t },
+                else => {},
+            }
+        }
+        return .{ .single = "" };
+    }
+
+    // Composite key: join all key values with commas
+    var buf = std.ArrayList(u8).init(allocator);
+    var first = true;
+    for (col_defs, 0..) |col, i| {
+        if (col.isKey() and i < col_values.len) {
+            if (!first) buf.appendSlice(",") catch return .{ .single = "" };
+            first = false;
+            switch (col_values[i]) {
+                .text => |t| buf.appendSlice(t) catch return .{ .single = "" },
+                .null_value => buf.appendSlice("NULL") catch return .{ .single = "" },
+                .unchanged => buf.appendSlice("(unchanged)") catch return .{ .single = "" },
+            }
         }
     }
-    return "";
+    return .{ .composite = buf.toOwnedSlice() catch return .{ .single = "" } };
 }
 
 // ============================================================================
@@ -1337,8 +1384,11 @@ test "extractPrimaryKey uses key column" {
         .{ .text = "Alice" },
         .{ .text = "99" },
     };
-    const pk = extractPrimaryKey(&col_defs, &col_values);
-    try std.testing.expectEqualStrings("99", pk);
+    const pk = extractPrimaryKey(std.testing.allocator, &col_defs, &col_values);
+    switch (pk) {
+        .single => |s| try std.testing.expectEqualStrings("99", s),
+        .composite => try std.testing.expect(false),
+    }
 }
 
 test "extractPrimaryKey falls back to first column" {
@@ -1350,8 +1400,33 @@ test "extractPrimaryKey falls back to first column" {
         .{ .text = "Alice" },
         .{ .text = "alice@example.com" },
     };
-    const pk = extractPrimaryKey(&col_defs, &col_values);
-    try std.testing.expectEqualStrings("Alice", pk);
+    const pk = extractPrimaryKey(std.testing.allocator, &col_defs, &col_values);
+    switch (pk) {
+        .single => |s| try std.testing.expectEqualStrings("Alice", s),
+        .composite => try std.testing.expect(false),
+    }
+}
+
+test "extractPrimaryKey handles composite keys" {
+    const allocator = std.testing.allocator;
+    const col_defs = [_]ColumnDef{
+        .{ .flags = 1, .name = "tenant_id", .type_oid = 23, .type_modifier = -1 },
+        .{ .flags = 1, .name = "user_id", .type_oid = 23, .type_modifier = -1 },
+        .{ .flags = 0, .name = "name", .type_oid = 25, .type_modifier = -1 },
+    };
+    const col_values = [_]ColumnValue{
+        .{ .text = "10" },
+        .{ .text = "42" },
+        .{ .text = "Alice" },
+    };
+    const pk = extractPrimaryKey(allocator, &col_defs, &col_values);
+    switch (pk) {
+        .single => try std.testing.expect(false),
+        .composite => |s| {
+            defer allocator.free(s);
+            try std.testing.expectEqualStrings("10,42", s);
+        },
+    }
 }
 
 fn buildTestBemiMessage(allocator: std.mem.Allocator, prefix: []const u8, content: []const u8, transactional: bool) ![]u8 {

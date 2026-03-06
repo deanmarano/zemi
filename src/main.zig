@@ -119,7 +119,7 @@ pub fn main() !void {
     // Start health check server if configured
     var health_server: ?*health.HealthServer = null;
     if (config.health_port) |port| {
-        if (health.HealthServer.start(port, allocator)) |hs| {
+        if (health.HealthServer.start(port, allocator, &m)) |hs| {
             health_server = hs;
             log.info("health check server listening on port {d}", .{port});
         } else |err| {

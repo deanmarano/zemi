@@ -36,6 +36,8 @@ pub const Storage = struct {
                 null, // normal connection, not replication
                 config.getDestSslMode(),
                 config.getDestSslRootCert(),
+                config.connect_timeout_secs,
+                config.query_timeout_secs,
             ),
             .allocator = allocator,
             .config = config,
@@ -73,6 +75,8 @@ pub const Storage = struct {
             null,
             self.config.getDestSslMode(),
             self.config.getDestSslRootCert(),
+            self.config.connect_timeout_secs,
+            self.config.query_timeout_secs,
         );
 
         self.runMigrations() catch |err| {

@@ -22,8 +22,8 @@ pub const Connection = struct {
     tls_client: ?tls.Client = null,
     ca_bundle: ?Certificate.Bundle = null,
 
-    // Read buffer for receiving messages
-    read_buf: [64 * 1024]u8 = undefined,
+    // Read buffer for receiving messages (heap-allocated, growable)
+    read_buf: []u8 = &.{},
     read_pos: usize = 0,
     read_len: usize = 0,
 
@@ -41,6 +41,11 @@ pub const Connection = struct {
     server_params: std.StringHashMap([]const u8),
     is_ready: bool = false,
     scram_client: ?scram.ScramClient = null,
+
+    /// Initial (and minimum) buffer size: 64 KB — covers most messages.
+    const INITIAL_BUF_SIZE: usize = 64 * 1024;
+    /// Hard upper bound to prevent unbounded memory growth: 256 MB.
+    const MAX_BUF_SIZE: usize = 256 * 1024 * 1024;
 
     pub const ConnectError = error{
         AuthenticationFailed,
@@ -72,6 +77,8 @@ pub const Connection = struct {
         replication: ?[]const u8,
         ssl_mode: SslMode,
         ssl_root_cert: ?[]const u8,
+        connect_timeout_secs: u32,
+        query_timeout_secs: u32,
     ) ConnectError!Connection {
         // Try numeric IP first (no allocation needed), then fall back to
         // DNS resolution for hostnames like "localhost".
@@ -91,9 +98,27 @@ pub const Connection = struct {
             }
         };
 
+        // Apply socket-level read/write timeouts if configured.
+        // These protect against hangs during authentication, queries, etc.
+        if (connect_timeout_secs > 0) {
+            const timeout = posix.timeval{
+                .sec = @intCast(connect_timeout_secs),
+                .usec = 0,
+            };
+            posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch |err| {
+                log.warn("failed to set SO_RCVTIMEO: {}", .{err});
+            };
+            posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch |err| {
+                log.warn("failed to set SO_SNDTIMEO: {}", .{err});
+            };
+        }
+
+        const read_buf = try allocator.alloc(u8, Connection.INITIAL_BUF_SIZE);
+
         var conn = Connection{
             .stream = stream,
             .allocator = allocator,
+            .read_buf = read_buf,
             .host = host,
             .port = port,
             .user = user,
@@ -109,6 +134,7 @@ pub const Connection = struct {
                 log.err("SSL negotiation failed: {}", .{err});
                 conn.server_params.deinit();
                 conn.stream.close();
+                allocator.free(read_buf);
                 return err;
             };
         }
@@ -117,8 +143,21 @@ pub const Connection = struct {
             if (conn.ca_bundle) |*bundle| bundle.deinit(allocator);
             conn.server_params.deinit();
             conn.stream.close();
+            allocator.free(read_buf);
             return err;
         };
+
+        // Set statement_timeout on normal (non-replication) connections.
+        // Replication connections use a different protocol and don't support SET.
+        if (query_timeout_secs > 0 and replication == null) {
+            var timeout_buf: [64]u8 = undefined;
+            const timeout_sql = std.fmt.bufPrint(&timeout_buf, "SET statement_timeout = '{d}s'", .{
+                query_timeout_secs,
+            }) catch unreachable;
+            conn.exec(timeout_sql) catch |err| {
+                log.warn("failed to set statement_timeout: {}", .{err});
+            };
+        }
 
         return conn;
     }
@@ -129,6 +168,7 @@ pub const Connection = struct {
             if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
             self.server_params.deinit();
             self.stream.close();
+            self.allocator.free(self.read_buf);
             return;
         };
         defer self.allocator.free(term_msg);
@@ -136,6 +176,7 @@ pub const Connection = struct {
         if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
         self.server_params.deinit();
         self.stream.close();
+        self.allocator.free(self.read_buf);
     }
 
     // ========================================================================
@@ -548,6 +589,10 @@ pub const Connection = struct {
 
     /// Read a single raw backend message from the connection.
     pub fn readMessage(self: *Connection) ConnectError!protocol.RawMessage {
+        // If the buffer grew large for a previous message and is now mostly
+        // consumed, shrink it back to the default size to release memory.
+        self.maybeShrinkBuffer();
+
         // Ensure we have at least 5 bytes (type + length)
         try self.ensureBuffered(5);
 
@@ -604,7 +649,7 @@ pub const Connection = struct {
 
     fn ensureBuffered(self: *Connection, needed: usize) !void {
         while (self.read_len - self.read_pos < needed) {
-            // Compact buffer if needed
+            // Compact buffer: shift unconsumed data to the front
             if (self.read_pos > 0) {
                 const remaining = self.read_len - self.read_pos;
                 if (remaining > 0) {
@@ -614,11 +659,53 @@ pub const Connection = struct {
                 self.read_pos = 0;
             }
 
+            // Grow buffer if it cannot hold `needed` bytes even when fully compacted
+            if (needed > self.read_buf.len) {
+                if (needed > MAX_BUF_SIZE) {
+                    log.err("message size {d} bytes exceeds maximum buffer size {d} bytes", .{ needed, MAX_BUF_SIZE });
+                    return error.UnexpectedEndOfData;
+                }
+                // Double the buffer until it fits, capped at MAX_BUF_SIZE
+                var new_size = self.read_buf.len;
+                while (new_size < needed) {
+                    new_size = @min(new_size * 2, MAX_BUF_SIZE);
+                }
+                log.debug("growing read buffer from {d} to {d} bytes for {d}-byte message", .{
+                    self.read_buf.len, new_size, needed,
+                });
+                const new_buf = try self.allocator.alloc(u8, new_size);
+                if (self.read_len > 0) {
+                    @memcpy(new_buf[0..self.read_len], self.read_buf[0..self.read_len]);
+                }
+                self.allocator.free(self.read_buf);
+                self.read_buf = new_buf;
+            }
+
             // Read more data (through TLS if active)
             const n = try self.tlsRead(self.read_buf[self.read_len..]);
             if (n == 0) return error.UnexpectedEndOfData;
             self.read_len += n;
         }
+    }
+
+    /// Shrink the read buffer back to the initial size if it grew large
+    /// and most data has been consumed. Call after processing a message.
+    fn maybeShrinkBuffer(self: *Connection) void {
+        if (self.read_buf.len <= INITIAL_BUF_SIZE) return;
+
+        const unconsumed = self.read_len - self.read_pos;
+        // Only shrink if unconsumed data fits in the initial buffer
+        if (unconsumed > INITIAL_BUF_SIZE) return;
+
+        const new_buf = self.allocator.alloc(u8, INITIAL_BUF_SIZE) catch return;
+        if (unconsumed > 0) {
+            @memcpy(new_buf[0..unconsumed], self.read_buf[self.read_pos .. self.read_pos + unconsumed]);
+        }
+        self.allocator.free(self.read_buf);
+        self.read_buf = new_buf;
+        self.read_len = unconsumed;
+        self.read_pos = 0;
+        log.debug("shrunk read buffer back to {d} bytes", .{INITIAL_BUF_SIZE});
     }
 
     /// Check if the underlying socket has data available for reading

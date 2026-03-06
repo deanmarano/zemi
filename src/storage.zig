@@ -330,22 +330,34 @@ pub const Storage = struct {
     }
 
     /// Append a JSON object from NamedValues (without surrounding quotes).
+    /// TOASTed (unchanged) columns are omitted entirely — they represent
+    /// values that PostgreSQL did not send because they weren't modified.
+    /// Including them as `null` would be incorrect: consumers couldn't
+    /// distinguish "unchanged" from "actually NULL".
     fn appendJsonObject(buf: *std.ArrayList(u8), named_values: ?[]const decoder.NamedValue) !void {
         const nvs = named_values orelse {
             try buf.appendSlice("{}");
             return;
         };
         try buf.append('{');
-        for (nvs, 0..) |nv, i| {
-            if (i > 0) try buf.appendSlice(", ");
-            // Key
-            try appendJsonString(buf, nv.name);
-            try buf.appendSlice(": ");
-            // Value
+        var first = true;
+        for (nvs) |nv| {
             switch (nv.value) {
-                .text => |t| try appendJsonString(buf, t),
-                .null_value => try buf.appendSlice("null"),
-                .unchanged => try buf.appendSlice("null"), // treat as null in JSON
+                .unchanged => continue, // omit TOASTed columns
+                .text => |t| {
+                    if (!first) try buf.appendSlice(", ");
+                    first = false;
+                    try appendJsonString(buf, nv.name);
+                    try buf.appendSlice(": ");
+                    try appendJsonString(buf, t);
+                },
+                .null_value => {
+                    if (!first) try buf.appendSlice(", ");
+                    first = false;
+                    try appendJsonString(buf, nv.name);
+                    try buf.appendSlice(": ");
+                    try buf.appendSlice("null");
+                },
             }
         }
         try buf.append('}');
@@ -452,6 +464,32 @@ test "appendJsonObject produces valid JSON" {
     };
     try Storage.appendJsonObject(&buf, &nvs);
     try std.testing.expectEqualStrings("{\"id\": \"42\", \"name\": \"Alice\", \"email\": null}", buf.items);
+}
+
+test "appendJsonObject omits unchanged (TOASTed) columns" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    const nvs = [_]decoder.NamedValue{
+        .{ .name = "id", .value = .{ .text = "42" } },
+        .{ .name = "bio", .value = .{ .unchanged = {} } }, // TOASTed — should be omitted
+        .{ .name = "name", .value = .{ .text = "Alice" } },
+    };
+    try Storage.appendJsonObject(&buf, &nvs);
+    try std.testing.expectEqualStrings("{\"id\": \"42\", \"name\": \"Alice\"}", buf.items);
+}
+
+test "appendJsonObject omits all unchanged columns" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    // All columns unchanged — should produce empty object
+    const nvs = [_]decoder.NamedValue{
+        .{ .name = "id", .value = .{ .unchanged = {} } },
+        .{ .name = "name", .value = .{ .unchanged = {} } },
+    };
+    try Storage.appendJsonObject(&buf, &nvs);
+    try std.testing.expectEqualStrings("{}", buf.items);
 }
 
 test "appendJsonbLiteral wraps in single quotes" {

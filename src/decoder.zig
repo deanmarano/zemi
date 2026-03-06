@@ -520,6 +520,20 @@ pub const Decoder = struct {
     transaction_changes: std.ArrayList(Change),
     transaction_context: ?[]const u8 = null, // context from _bemi logical message
 
+    // Large transaction support
+    max_transaction_changes: ?u32 = null,
+
+    pub const DecodeResult = union(enum) {
+        /// No changes to return (e.g., Begin, Relation, mid-transaction DML below threshold).
+        none,
+        /// A complete committed transaction's changes.
+        commit: []Change,
+        /// A mid-transaction flush due to exceeding max_transaction_changes.
+        /// The transaction is still in progress; more changes or a commit will follow.
+        /// Context is NOT stamped on these changes (it may arrive later in the transaction).
+        flush: []Change,
+    };
+
     pub fn init(allocator: std.mem.Allocator, database: []const u8) Decoder {
         return .{
             .allocator = allocator,
@@ -546,10 +560,12 @@ pub const Decoder = struct {
         self.transaction_changes.clearRetainingCapacity();
     }
 
-    /// Process a single XLogData payload. Returns completed transaction
-    /// changes on Commit, null otherwise.
+    /// Process a single XLogData payload. Returns a DecodeResult:
+    /// - `.none` — no changes to emit (Begin, Relation, mid-transaction DML below threshold)
+    /// - `.commit` — completed transaction changes (on Commit message)
+    /// - `.flush` — mid-transaction early flush (max_transaction_changes exceeded)
     /// All strings in returned Change records are owned (heap-allocated).
-    pub fn decode(self: *Decoder, data: []const u8, lsn: u64) !?[]Change {
+    pub fn decode(self: *Decoder, data: []const u8, lsn: u64) !DecodeResult {
         const msg = try parsePgOutputMessage(self.allocator, data);
 
         switch (msg) {
@@ -570,7 +586,9 @@ pub const Decoder = struct {
                 self.current_commit_timestamp = commit.commit_timestamp;
                 log.debug("COMMIT xid={d} changes={d}", .{ self.current_xid, self.transaction_changes.items.len });
 
-                // Stamp context onto all changes in this transaction
+                // Stamp context onto all changes in this transaction.
+                // Note: changes that were already flushed early (via max_transaction_changes)
+                // do NOT get context stamped — this is a known trade-off of streaming mode.
                 if (self.transaction_context) |ctx| {
                     for (self.transaction_changes.items) |*change| {
                         change.context = try self.allocator.dupe(u8, ctx);
@@ -583,9 +601,9 @@ pub const Decoder = struct {
                     // Return owned slice of changes; caller must free each
                     // Change via change.deinit() then free the slice.
                     const changes = try self.transaction_changes.toOwnedSlice();
-                    return changes;
+                    return .{ .commit = changes };
                 }
-                return null;
+                return .none;
             },
             .relation => |rel| {
                 log.debug("RELATION {s}.{s} id={d} cols={d}", .{
@@ -601,7 +619,7 @@ pub const Decoder = struct {
                 const rel = self.relation_cache.get(ins.relation_id) orelse {
                     log.warn("INSERT for unknown relation_id={d}", .{ins.relation_id});
                     self.allocator.free(ins.new_tuple.columns);
-                    return null;
+                    return .none;
                 };
 
                 const lsn_str = try self.dupeFormatLsn(lsn);
@@ -631,7 +649,7 @@ pub const Decoder = struct {
                     log.warn("UPDATE for unknown relation_id={d}", .{upd.relation_id});
                     if (upd.old_tuple) |old| self.allocator.free(old.columns);
                     self.allocator.free(upd.new_tuple.columns);
-                    return null;
+                    return .none;
                 };
 
                 const lsn_str = try self.dupeFormatLsn(lsn);
@@ -665,7 +683,7 @@ pub const Decoder = struct {
                 const rel = self.relation_cache.get(del.relation_id) orelse {
                     log.warn("DELETE for unknown relation_id={d}", .{del.relation_id});
                     self.allocator.free(del.old_tuple.columns);
-                    return null;
+                    return .none;
                 };
 
                 const lsn_str = try self.dupeFormatLsn(lsn);
@@ -741,7 +759,22 @@ pub const Decoder = struct {
                 log.warn("unknown pgoutput message type: 0x{x}", .{t});
             },
         }
-        return null;
+
+        // Check if we need to flush early due to max_transaction_changes
+        if (self.in_transaction) {
+            if (self.max_transaction_changes) |limit| {
+                if (self.transaction_changes.items.len >= limit) {
+                    log.info("flushing {d} changes mid-transaction (xid={d}, limit={d})", .{
+                        self.transaction_changes.items.len,
+                        self.current_xid,
+                        limit,
+                    });
+                    const changes = try self.transaction_changes.toOwnedSlice();
+                    return .{ .flush = changes };
+                }
+            }
+        }
+        return .none;
     }
 
     // ========================================================================
@@ -1240,20 +1273,20 @@ test "Decoder full transaction: Begin, Relation, Insert, Commit" {
         break :blk buf;
     };
     const begin_result = try dec.decode(&begin_data, 900);
-    try std.testing.expect(begin_result == null);
+    try std.testing.expect(begin_result == .none);
     try std.testing.expect(dec.in_transaction);
 
     // 2. Relation
     const rel_data = try buildTestRelationMsg(allocator);
     defer allocator.free(rel_data);
     const rel_result = try dec.decode(rel_data, 950);
-    try std.testing.expect(rel_result == null);
+    try std.testing.expect(rel_result == .none);
 
     // 3. Insert
     const ins_data = try buildTestInsertMsg(allocator, 16384);
     defer allocator.free(ins_data);
     const ins_result = try dec.decode(ins_data, 960);
-    try std.testing.expect(ins_result == null);
+    try std.testing.expect(ins_result == .none);
 
     // 4. Commit
     const commit_data = blk: {
@@ -1265,11 +1298,14 @@ test "Decoder full transaction: Begin, Relation, Insert, Commit" {
         mem.writeInt(i64, buf[18..26], 500000, .big);
         break :blk buf;
     };
-    const changes = try dec.decode(&commit_data, 1000);
-    try std.testing.expect(changes != null);
-    try std.testing.expectEqual(@as(usize, 1), changes.?.len);
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
 
-    const change = changes.?[0];
+    const change = changes[0];
     try std.testing.expectEqual(Operation.CREATE, change.operation);
     try std.testing.expectEqualStrings("testdb", change.database);
     try std.testing.expectEqualStrings("public", change.schema);
@@ -1284,10 +1320,10 @@ test "Decoder full transaction: Begin, Relation, Insert, Commit" {
     try std.testing.expect(change.context == null); // no _bemi message → null context
 
     // Free the returned changes (owned strings)
-    for (changes.?) |*c| {
+    for (changes) |*c| {
         c.deinit(allocator);
     }
-    allocator.free(changes.?);
+    allocator.free(changes);
 }
 
 test "extractPrimaryKey uses key column" {
@@ -1378,21 +1414,24 @@ test "context stitching: _bemi message stamps context on changes" {
 
     // 5. Commit
     const commit_data = buildTestCommitData();
-    const changes = try dec.decode(&commit_data, 1000);
-    try std.testing.expect(changes != null);
-    try std.testing.expectEqual(@as(usize, 1), changes.?.len);
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
 
     // Verify context was stamped
-    const change = changes.?[0];
+    const change = changes[0];
     try std.testing.expect(change.context != null);
     try std.testing.expectEqualStrings(context_json, change.context.?);
     try std.testing.expectEqual(Operation.CREATE, change.operation);
 
     // Free
-    for (changes.?) |*c| {
+    for (changes) |*c| {
         c.deinit(allocator);
     }
-    allocator.free(changes.?);
+    allocator.free(changes);
 }
 
 test "context stitching: non-transactional _bemi message is ignored" {
@@ -1421,16 +1460,19 @@ test "context stitching: non-transactional _bemi message is ignored" {
 
     // 5. Commit
     const commit_data = buildTestCommitData();
-    const changes = try dec.decode(&commit_data, 1000);
-    try std.testing.expect(changes != null);
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
 
     // Context should be null — non-transactional message ignored
-    try std.testing.expect(changes.?[0].context == null);
+    try std.testing.expect(changes[0].context == null);
 
-    for (changes.?) |*c| {
+    for (changes) |*c| {
         c.deinit(allocator);
     }
-    allocator.free(changes.?);
+    allocator.free(changes);
 }
 
 test "context stitching: non-_bemi prefix is ignored" {
@@ -1455,14 +1497,17 @@ test "context stitching: non-_bemi prefix is ignored" {
     _ = try dec.decode(ins_data, 930);
 
     const commit_data = buildTestCommitData();
-    const changes = try dec.decode(&commit_data, 1000);
-    try std.testing.expect(changes != null);
-    try std.testing.expect(changes.?[0].context == null);
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(changes[0].context == null);
 
-    for (changes.?) |*c| {
+    for (changes) |*c| {
         c.deinit(allocator);
     }
-    allocator.free(changes.?);
+    allocator.free(changes);
 }
 
 test "context stitching: multiple changes in same transaction share context" {
@@ -1492,20 +1537,23 @@ test "context stitching: multiple changes in same transaction share context" {
     _ = try dec.decode(ins2, 940);
 
     const commit_data = buildTestCommitData();
-    const changes = try dec.decode(&commit_data, 1000);
-    try std.testing.expect(changes != null);
-    try std.testing.expectEqual(@as(usize, 2), changes.?.len);
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), changes.len);
 
     // Both changes should have the same context
-    try std.testing.expect(changes.?[0].context != null);
-    try std.testing.expectEqualStrings(context_json, changes.?[0].context.?);
-    try std.testing.expect(changes.?[1].context != null);
-    try std.testing.expectEqualStrings(context_json, changes.?[1].context.?);
+    try std.testing.expect(changes[0].context != null);
+    try std.testing.expectEqualStrings(context_json, changes[0].context.?);
+    try std.testing.expect(changes[1].context != null);
+    try std.testing.expectEqualStrings(context_json, changes[1].context.?);
 
-    for (changes.?) |*c| {
+    for (changes) |*c| {
         c.deinit(allocator);
     }
-    allocator.free(changes.?);
+    allocator.free(changes);
 }
 
 test "Decoder full transaction: Begin, Relation, Truncate, Commit" {
@@ -1516,28 +1564,31 @@ test "Decoder full transaction: Begin, Relation, Truncate, Commit" {
     // 1. Begin
     const begin_data = buildTestBeginData(20);
     const begin_result = try dec.decode(&begin_data, 900);
-    try std.testing.expect(begin_result == null);
+    try std.testing.expect(begin_result == .none);
     try std.testing.expect(dec.in_transaction);
 
     // 2. Relation (relation_id = 16384, "public.users")
     const rel_data = try buildTestRelationMsg(allocator);
     defer allocator.free(rel_data);
     const rel_result = try dec.decode(rel_data, 950);
-    try std.testing.expect(rel_result == null);
+    try std.testing.expect(rel_result == .none);
 
     // 3. Truncate (single table)
     const trunc_data = try buildTestTruncateMsg(allocator, &[_]u32{16384}, 0);
     defer allocator.free(trunc_data);
     const trunc_result = try dec.decode(trunc_data, 960);
-    try std.testing.expect(trunc_result == null);
+    try std.testing.expect(trunc_result == .none);
 
     // 4. Commit
     const commit_data = buildTestCommitData();
-    const changes = try dec.decode(&commit_data, 1000);
-    try std.testing.expect(changes != null);
-    try std.testing.expectEqual(@as(usize, 1), changes.?.len);
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
 
-    const change = changes.?[0];
+    const change = changes[0];
     try std.testing.expectEqual(Operation.TRUNCATE, change.operation);
     try std.testing.expectEqualStrings("testdb", change.database);
     try std.testing.expectEqualStrings("public", change.schema);
@@ -1549,10 +1600,10 @@ test "Decoder full transaction: Begin, Relation, Truncate, Commit" {
     try std.testing.expect(!dec.in_transaction);
     try std.testing.expect(change.context == null);
 
-    for (changes.?) |*c| {
+    for (changes) |*c| {
         c.deinit(allocator);
     }
-    allocator.free(changes.?);
+    allocator.free(changes);
 }
 
 test "Decoder TRUNCATE with context stitching" {
@@ -1582,17 +1633,234 @@ test "Decoder TRUNCATE with context stitching" {
 
     // 5. Commit
     const commit_data = buildTestCommitData();
-    const changes = try dec.decode(&commit_data, 1000);
-    try std.testing.expect(changes != null);
-    try std.testing.expectEqual(@as(usize, 1), changes.?.len);
+    const result = try dec.decode(&commit_data, 1000);
+    const changes = switch (result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
 
-    const change = changes.?[0];
+    const change = changes[0];
     try std.testing.expectEqual(Operation.TRUNCATE, change.operation);
     try std.testing.expect(change.context != null);
     try std.testing.expectEqualStrings(context_json, change.context.?);
 
-    for (changes.?) |*c| {
+    for (changes) |*c| {
         c.deinit(allocator);
     }
-    allocator.free(changes.?);
+    allocator.free(changes);
+}
+
+test "Decoder mid-transaction flush when max_transaction_changes exceeded" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator, "testdb");
+    dec.max_transaction_changes = 2; // flush after every 2 changes
+    defer dec.deinit();
+
+    // 1. Begin
+    const begin_data = buildTestBeginData(30);
+    const begin_result = try dec.decode(&begin_data, 900);
+    try std.testing.expect(begin_result == .none);
+    try std.testing.expect(dec.in_transaction);
+
+    // 2. Relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    // 3. First insert — should not flush yet (1 < 2)
+    const ins1 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins1);
+    const result1 = try dec.decode(ins1, 920);
+    try std.testing.expect(result1 == .none);
+
+    // 4. Second insert — should trigger flush (2 >= 2)
+    const ins2 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins2);
+    const result2 = try dec.decode(ins2, 930);
+    const flushed = switch (result2) {
+        .flush => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), flushed.len);
+    // Still in transaction after flush
+    try std.testing.expect(dec.in_transaction);
+
+    for (flushed) |*c| {
+        c.deinit(allocator);
+    }
+    allocator.free(flushed);
+
+    // 5. Third insert — accumulates again (1 < 2)
+    const ins3 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins3);
+    const result3 = try dec.decode(ins3, 940);
+    try std.testing.expect(result3 == .none);
+
+    // 6. Commit — returns the remaining 1 change
+    const commit_data = buildTestCommitData();
+    const commit_result = try dec.decode(&commit_data, 1000);
+    const remaining = switch (commit_result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expect(!dec.in_transaction);
+
+    for (remaining) |*c| {
+        c.deinit(allocator);
+    }
+    allocator.free(remaining);
+}
+
+test "Decoder mid-transaction flush: context only stamped on unflushed changes" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator, "testdb");
+    dec.max_transaction_changes = 1; // flush after every change
+    defer dec.deinit();
+
+    // 1. Begin
+    const begin_data = buildTestBeginData(31);
+    _ = try dec.decode(&begin_data, 900);
+
+    // 2. Relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    // 3. _bemi context message
+    const context_json = "{\"user_id\": \"flush_test\"}";
+    const bemi_msg = try buildTestBemiMessage(allocator, "_bemi", context_json, true);
+    defer allocator.free(bemi_msg);
+    _ = try dec.decode(bemi_msg, 920);
+
+    // 4. First insert — triggers flush (1 >= 1). Flushed changes do NOT get context.
+    const ins1 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins1);
+    const result1 = try dec.decode(ins1, 930);
+    const flushed = switch (result1) {
+        .flush => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), flushed.len);
+    // Flushed changes should NOT have context (known trade-off)
+    try std.testing.expect(flushed[0].context == null);
+
+    for (flushed) |*c| {
+        c.deinit(allocator);
+    }
+    allocator.free(flushed);
+
+    // 5. Second insert — triggers another flush
+    const ins2 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins2);
+    const result2 = try dec.decode(ins2, 940);
+    const flushed2 = switch (result2) {
+        .flush => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(flushed2[0].context == null);
+
+    for (flushed2) |*c| {
+        c.deinit(allocator);
+    }
+    allocator.free(flushed2);
+
+    // 6. Third insert — will also be flushed
+    const ins3 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins3);
+    const result3 = try dec.decode(ins3, 950);
+    const flushed3 = switch (result3) {
+        .flush => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    // This one also gets flushed without context
+    try std.testing.expect(flushed3[0].context == null);
+    for (flushed3) |*c| {
+        c.deinit(allocator);
+    }
+    allocator.free(flushed3);
+
+    // 7. Commit with no remaining changes
+    const commit_data = buildTestCommitData();
+    const commit_result = try dec.decode(&commit_data, 1000);
+    // No remaining changes — all were flushed
+    try std.testing.expect(commit_result == .none);
+}
+
+test "Decoder flush with limit=0 flushes every DML immediately" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator, "testdb");
+    dec.max_transaction_changes = 0; // flush after every DML
+    defer dec.deinit();
+
+    // 1. Begin
+    const begin_data = buildTestBeginData(40);
+    _ = try dec.decode(&begin_data, 900);
+
+    // 2. Relation
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    // 3. Single insert — should trigger flush immediately (1 >= 0)
+    const ins1 = try buildTestInsertMsg(allocator, 16384);
+    defer allocator.free(ins1);
+    const result1 = try dec.decode(ins1, 920);
+    const flushed = switch (result1) {
+        .flush => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), flushed.len);
+    try std.testing.expect(dec.in_transaction);
+
+    for (flushed) |*c| {
+        c.deinit(allocator);
+    }
+    allocator.free(flushed);
+
+    // 4. Commit — no remaining changes
+    const commit_data = buildTestCommitData();
+    const commit_result = try dec.decode(&commit_data, 1000);
+    try std.testing.expect(commit_result == .none);
+}
+
+test "Decoder without max_transaction_changes never flushes mid-transaction" {
+    const allocator = std.testing.allocator;
+    var dec = Decoder.init(allocator, "testdb");
+    // max_transaction_changes defaults to null — no flushing
+    defer dec.deinit();
+
+    const begin_data = buildTestBeginData(41);
+    _ = try dec.decode(&begin_data, 900);
+
+    const rel_data = try buildTestRelationMsg(allocator);
+    defer allocator.free(rel_data);
+    _ = try dec.decode(rel_data, 910);
+
+    // Insert 5 changes — none should trigger flush
+    var i: u64 = 0;
+    var ins_bufs: [5][]u8 = undefined;
+    while (i < 5) : (i += 1) {
+        ins_bufs[i] = try buildTestInsertMsg(allocator, 16384);
+        const result = try dec.decode(ins_bufs[i], 920 + i * 10);
+        try std.testing.expect(result == .none);
+    }
+    defer for (&ins_bufs) |buf| {
+        allocator.free(buf);
+    };
+
+    // Commit returns all 5 changes at once
+    const commit_data = buildTestCommitData();
+    const commit_result = try dec.decode(&commit_data, 1000);
+    const changes = switch (commit_result) {
+        .commit => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 5), changes.len);
+
+    for (changes) |*c| {
+        c.deinit(allocator);
+    }
+    allocator.free(changes);
 }

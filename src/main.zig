@@ -217,8 +217,14 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
 
     log.info("streaming WAL changes... (ctrl-c to stop)", .{});
 
+    // Start background keepalive thread to prevent wal_sender_timeout
+    // during long persistChanges() calls. Sends StandbyStatusUpdate
+    // every 10 seconds, well within PostgreSQL's default 60s timeout.
+    stream.startKeepaliveThread(10);
+
     // Step 7: Initialize the pgoutput decoder
     var dec = decoder.Decoder.init(allocator, config.db_name);
+    dec.max_transaction_changes = config.max_transaction_changes;
     defer dec.deinit();
 
     // Step 8: Main loop - read, decode, persist WAL changes
@@ -230,19 +236,28 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
         const xlog = try stream.poll();
 
         if (xlog) |data| {
-            // Decode the pgoutput message; returns changes on Commit
-            const tx_changes = dec.decode(data.data, data.wal_start) catch |err| {
+            // Decode the pgoutput message; returns changes on Commit or early flush
+            const result = dec.decode(data.data, data.wal_start) catch |err| {
                 log.warn("decode error: {}, skipping message", .{err});
                 Metrics.inc(&m.decode_errors_total);
                 continue;
             };
 
-            if (tx_changes) |changes| {
+            const changes: ?[]decoder.Change = switch (result) {
+                .commit => |c| c,
+                .flush => |c| blk: {
+                    Metrics.inc(&m.transaction_early_flushes_total);
+                    break :blk c;
+                },
+                .none => null,
+            };
+
+            if (changes) |tx_changes| {
                 defer {
-                    for (changes) |change| {
+                    for (tx_changes) |change| {
                         change.deinit(allocator);
                     }
-                    allocator.free(changes);
+                    allocator.free(tx_changes);
                 }
 
                 // Filter out changes to the 'changes' table itself to avoid
@@ -250,7 +265,7 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
                 // Also apply TABLES filter if configured.
                 var filtered = std.ArrayList(decoder.Change).init(allocator);
                 defer filtered.deinit();
-                for (changes) |change| {
+                for (tx_changes) |change| {
                     if (std.mem.eql(u8, change.table, "changes")) {
                         Metrics.inc(&m.changes_filtered_total);
                         continue;
@@ -325,11 +340,6 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
                     stream.last_received_lsn - stream.last_flushed_lsn,
                 });
                 last_summary_time = now;
-
-                // Send periodic status update
-                stream.sendStatusUpdate() catch |err| {
-                    log.warn("failed to send status update: {}", .{err});
-                };
             }
         }
     }

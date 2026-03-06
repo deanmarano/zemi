@@ -18,6 +18,13 @@ pub const ReplicationStream = struct {
     last_received_lsn: u64 = 0,
     last_flushed_lsn: u64 = 0,
 
+    // Thread safety for concurrent writes (keepalive thread + main thread)
+    write_mutex: std.Thread.Mutex = .{},
+
+    // Background keepalive thread
+    keepalive_thread: ?std.Thread = null,
+    keepalive_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     /// Callback type for processing XLogData messages.
     pub const XLogCallback = *const fn (data: protocol.XLogData, ctx: ?*anyopaque) void;
 
@@ -47,7 +54,50 @@ pub const ReplicationStream = struct {
     }
 
     pub fn deinit(self: *ReplicationStream) void {
+        self.stopKeepaliveThread();
         self.conn.close();
+    }
+
+    /// Start a background thread that sends StandbyStatusUpdate every
+    /// `interval_secs` seconds. This prevents PostgreSQL from killing the
+    /// replication connection via wal_sender_timeout when persistChanges()
+    /// blocks the main loop for an extended period.
+    pub fn startKeepaliveThread(self: *ReplicationStream, interval_secs: u64) void {
+        if (self.keepalive_thread != null) return; // already running
+        self.keepalive_stop.store(false, .release);
+
+        self.keepalive_thread = std.Thread.spawn(.{}, keepaliveLoop, .{ self, interval_secs }) catch |err| {
+            log.warn("failed to start keepalive thread: {}", .{err});
+            return;
+        };
+        log.info("keepalive thread started (interval={d}s)", .{interval_secs});
+    }
+
+    /// Stop the background keepalive thread.
+    pub fn stopKeepaliveThread(self: *ReplicationStream) void {
+        if (self.keepalive_thread) |t| {
+            self.keepalive_stop.store(true, .release);
+            t.join();
+            self.keepalive_thread = null;
+            log.info("keepalive thread stopped", .{});
+        }
+    }
+
+    fn keepaliveLoop(self: *ReplicationStream, interval_secs: u64) void {
+        const interval_ns = interval_secs * std.time.ns_per_s;
+        while (!self.keepalive_stop.load(.acquire)) {
+            std.time.sleep(interval_ns);
+            if (self.keepalive_stop.load(.acquire)) break;
+
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+
+            self.sendStatusUpdateUnlocked() catch |err| {
+                log.warn("keepalive thread: failed to send status update: {}", .{err});
+                // Don't break — transient errors are OK, the main thread will
+                // detect a dead connection on its next poll() call.
+            };
+        }
     }
 
     /// Run IDENTIFY_SYSTEM to get replication identity info.
@@ -155,7 +205,9 @@ pub const ReplicationStream = struct {
                     Metrics.set(&m.last_received_lsn, self.last_received_lsn);
                 }
                 if (ka.reply_requested) {
-                    try self.sendStatusUpdate();
+                    self.write_mutex.lock();
+                    defer self.write_mutex.unlock();
+                    try self.sendStatusUpdateUnlocked();
                 }
                 return null;
             },
@@ -167,7 +219,16 @@ pub const ReplicationStream = struct {
     }
 
     /// Send a StandbyStatusUpdate to the server.
+    /// Thread-safe: acquires write_mutex.
     pub fn sendStatusUpdate(self: *ReplicationStream) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        try self.sendStatusUpdateUnlocked();
+    }
+
+    /// Internal: send status update without acquiring the mutex.
+    /// Caller must hold write_mutex.
+    fn sendStatusUpdateUnlocked(self: *ReplicationStream) !void {
         const now = protocol.pgEpochMicroseconds();
         const msg = try protocol.buildStandbyStatusUpdate(
             self.allocator,

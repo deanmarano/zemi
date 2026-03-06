@@ -74,6 +74,13 @@ pub const Config = struct {
     metrics_port: ?u16 = null, // null = metrics endpoint disabled
     cleanup_on_shutdown: bool = false, // drop slot + publication on graceful shutdown
 
+    // Large transaction handling: flush accumulated changes to storage
+    // mid-transaction when this limit is exceeded. null = unlimited (default).
+    // Changes are idempotent via ON CONFLICT DO NOTHING, so early flushes
+    // are safe even if the transaction is later rolled back (the changes
+    // simply won't match any future commit and are harmless duplicates).
+    max_transaction_changes: ?u32 = null,
+
     /// Returns the effective destination host (falls back to source).
     pub fn getDestHost(self: Config) []const u8 {
         return self.dest_db_host orelse self.db_host;
@@ -211,6 +218,13 @@ pub const Config = struct {
             }
         }
 
+        if (std.posix.getenv("MAX_TRANSACTION_CHANGES")) |v| {
+            config.max_transaction_changes = std.fmt.parseUnsigned(u32, v, 10) catch blk: {
+                log.warn("invalid MAX_TRANSACTION_CHANGES '{s}', disabling limit", .{v});
+                break :blk null;
+            };
+        }
+
         return config;
     }
 
@@ -271,6 +285,9 @@ pub const Config = struct {
             self.shutdown_timeout_secs,
             self.cleanup_on_shutdown,
         });
+        if (self.max_transaction_changes) |limit| {
+            log.info("config: max_transaction_changes={d}", .{limit});
+        }
         if (self.health_port) |port| {
             log.info("config: health_port={d}", .{port});
         }
@@ -359,4 +376,19 @@ test "dest SSL falls back to source SSL settings" {
     };
     try std.testing.expectEqual(SslMode.require, config2.getDestSslMode());
     try std.testing.expectEqualStrings("/other/ca.crt", config2.getDestSslRootCert().?);
+}
+
+test "max_transaction_changes defaults to null (disabled)" {
+    const config = Config{};
+    try std.testing.expect(config.max_transaction_changes == null);
+}
+
+test "max_transaction_changes can be set explicitly" {
+    const config = Config{ .max_transaction_changes = 5000 };
+    try std.testing.expectEqual(@as(u32, 5000), config.max_transaction_changes.?);
+}
+
+test "validate accepts config with max_transaction_changes set" {
+    const config = Config{ .max_transaction_changes = 100 };
+    try std.testing.expect(config.validate() == null);
 }

@@ -45,6 +45,9 @@ pub const Metrics = struct {
     /// Total replication reconnections (main loop restarts).
     replication_reconnections_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    /// Mid-transaction flushes due to MAX_TRANSACTION_CHANGES limit.
+    transaction_early_flushes_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     // --- Gauges (current value) ---
 
     /// Highest WAL position received.
@@ -98,6 +101,7 @@ pub const Metrics = struct {
         const persist_errs = self.persist_errors_total.load(.monotonic);
         const storage_reconns = self.storage_reconnections_total.load(.monotonic);
         const repl_reconns = self.replication_reconnections_total.load(.monotonic);
+        const early_flushes = self.transaction_early_flushes_total.load(.monotonic);
         const received_lsn = self.last_received_lsn.load(.monotonic);
         const flushed_lsn = self.last_flushed_lsn.load(.monotonic);
         const lag = if (received_lsn >= flushed_lsn) received_lsn - flushed_lsn else 0;
@@ -125,6 +129,7 @@ pub const Metrics = struct {
             try appendSimpleCounterPrefixed(&buf, prefix, "persist_errors_total", "Total persist errors encountered.", persist_errs);
             try appendSimpleCounterPrefixed(&buf, prefix, "storage_reconnections_total", "Total storage reconnections.", storage_reconns);
             try appendSimpleCounterPrefixed(&buf, prefix, "replication_reconnections_total", "Total replication reconnections.", repl_reconns);
+            try appendSimpleCounterPrefixed(&buf, prefix, "transaction_early_flushes_total", "Mid-transaction flushes due to MAX_TRANSACTION_CHANGES limit.", early_flushes);
 
             // Gauges
             try appendSimpleGaugePrefixed(&buf, prefix, "replication_lag_bytes", "Replication lag in bytes (received - flushed LSN).", lag);
@@ -446,4 +451,31 @@ test "MetricsServer http_ok_response is well-formed" {
     const resp = MetricsServer.http_ok_response;
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK"));
     try std.testing.expect(std.mem.indexOf(u8, resp, "ok\n") != null);
+}
+
+test "Metrics.render includes transaction_early_flushes_total" {
+    var m = Metrics{ .start_time_secs = std.time.timestamp() };
+    Metrics.inc(&m.transaction_early_flushes_total);
+    Metrics.inc(&m.transaction_early_flushes_total);
+    Metrics.inc(&m.transaction_early_flushes_total);
+
+    const output = try m.render(std.testing.allocator);
+    defer std.testing.allocator.free(output);
+
+    // Check zemi_ prefix
+    try std.testing.expect(std.mem.indexOf(u8, output, "# HELP zemi_transaction_early_flushes_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE zemi_transaction_early_flushes_total counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_transaction_early_flushes_total 3") != null);
+
+    // Check bemi_ backward-compat prefix
+    try std.testing.expect(std.mem.indexOf(u8, output, "bemi_transaction_early_flushes_total 3") != null);
+}
+
+test "Metrics.render shows zero for transaction_early_flushes_total by default" {
+    var m = Metrics{ .start_time_secs = std.time.timestamp() };
+
+    const output = try m.render(std.testing.allocator);
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "zemi_transaction_early_flushes_total 0") != null);
 }

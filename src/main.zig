@@ -10,6 +10,7 @@ const Storage = @import("storage.zig").Storage;
 const health = @import("health.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const MetricsServer = @import("metrics.zig").MetricsServer;
+const snapshot = @import("snapshot.zig");
 
 // Allow all messages at comptime; runtime filtering is in our custom logFn.
 pub const std_options: std.Options = .{
@@ -251,7 +252,24 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
     });
 
     // Step 5: Create replication slot
-    try stream.createSlotIfNotExists();
+    const slot_result = try stream.createSlotIfNotExists();
+    defer {
+        if (slot_result.snapshot_name) |snap| {
+            allocator.free(snap);
+        }
+    }
+
+    // Step 5b: Perform initial snapshot if a snapshot was exported
+    if (slot_result.snapshot_name) |snap_name| {
+        log.info("performing initial snapshot of existing data...", .{});
+        snapshot.performSnapshot(allocator, config, &storage, snap_name, m) catch |err| {
+            log.err("initial snapshot failed: {}, continuing with streaming only", .{err});
+            // Non-fatal: we still start streaming. The snapshot data will be
+            // missing, but all new changes will be captured.
+        };
+    } else if (config.initial_snapshot and !slot_result.already_existed) {
+        log.warn("INITIAL_SNAPSHOT=true but no snapshot name was returned from slot creation", .{});
+    }
 
     // Step 6: Start streaming
     try stream.startReplication(0);
@@ -401,6 +419,7 @@ test {
     _ = @import("health.zig");
     _ = @import("scram.zig");
     _ = @import("metrics.zig");
+    _ = @import("snapshot.zig");
 }
 
 test "isPermanentError classifies auth errors as permanent" {

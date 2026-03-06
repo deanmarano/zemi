@@ -138,26 +138,86 @@ pub const ReplicationStream = struct {
         };
     }
 
+    /// Result of slot creation: tells the caller whether a snapshot is
+    /// available for initial data capture.
+    pub const SlotCreationResult = struct {
+        /// The exported snapshot name (heap-allocated, caller must free).
+        /// Non-null only when a new slot was created with EXPORT_SNAPSHOT.
+        snapshot_name: ?[]const u8 = null,
+        /// Whether the slot already existed (no snapshot possible).
+        already_existed: bool = false,
+    };
+
     /// Create a replication slot if it doesn't already exist.
     /// Uses pgoutput logical decoding plugin.
-    pub fn createSlotIfNotExists(self: *ReplicationStream) !void {
-        // Try to create the slot; ignore the "already exists" error
+    ///
+    /// When `initial_snapshot` is true in config and the slot is newly created,
+    /// the slot is created WITH snapshot export (omitting NOEXPORT_SNAPSHOT),
+    /// and the returned `snapshot_name` can be used by a second connection to
+    /// read a consistent snapshot of all existing data. The snapshot must be
+    /// consumed before `startReplication()` is called, because the snapshot
+    /// is only valid while the exporting transaction (the slot creation) is
+    /// still open — but for replication slots, PostgreSQL keeps it valid
+    /// until streaming begins.
+    ///
+    /// Caller must free `result.snapshot_name` if non-null.
+    pub fn createSlotIfNotExists(self: *ReplicationStream) !SlotCreationResult {
         var buf: [256]u8 = undefined;
-        const sql = std.fmt.bufPrint(&buf, "CREATE_REPLICATION_SLOT {s} LOGICAL pgoutput NOEXPORT_SNAPSHOT", .{
-            self.config.slot_name,
-        }) catch return error.ServerError;
 
-        self.conn.exec(sql) catch |err| {
-            switch (err) {
-                error.ServerError => {
-                    // Slot may already exist, that's OK
-                    log.info("replication slot '{s}' may already exist, continuing", .{self.config.slot_name});
-                },
-                else => return err,
+        if (self.config.initial_snapshot) {
+            // Create WITHOUT NOEXPORT_SNAPSHOT to get a snapshot name
+            const sql = std.fmt.bufPrint(&buf, "CREATE_REPLICATION_SLOT {s} LOGICAL pgoutput", .{
+                self.config.slot_name,
+            }) catch return error.ServerError;
+
+            var result = self.conn.query(sql) catch |err| {
+                switch (err) {
+                    error.ServerError => {
+                        log.info("replication slot '{s}' may already exist, continuing", .{self.config.slot_name});
+                        return .{ .already_existed = true };
+                    },
+                    else => return err,
+                }
+            };
+            defer result.deinit();
+
+            // Parse the snapshot name from the result.
+            // CREATE_REPLICATION_SLOT returns: slot_name, consistent_point, snapshot_name, output_plugin
+            if (result.rows.len > 0 and result.rows[0].columns.len >= 3) {
+                const snapshot_col = result.rows[0].columns[2];
+                switch (snapshot_col) {
+                    .text => |snap_name| {
+                        if (snap_name.len > 0) {
+                            const duped = try self.allocator.dupe(u8, snap_name);
+                            log.info("replication slot '{s}' created with snapshot '{s}'", .{ self.config.slot_name, duped });
+                            return .{ .snapshot_name = duped };
+                        }
+                    },
+                    .null_value => {},
+                }
             }
-        };
 
-        log.info("replication slot '{s}' ready", .{self.config.slot_name});
+            log.info("replication slot '{s}' created (no snapshot name in response)", .{self.config.slot_name});
+            return .{};
+        } else {
+            // Standard path: create with NOEXPORT_SNAPSHOT (no snapshot overhead)
+            const sql = std.fmt.bufPrint(&buf, "CREATE_REPLICATION_SLOT {s} LOGICAL pgoutput NOEXPORT_SNAPSHOT", .{
+                self.config.slot_name,
+            }) catch return error.ServerError;
+
+            self.conn.exec(sql) catch |err| {
+                switch (err) {
+                    error.ServerError => {
+                        log.info("replication slot '{s}' may already exist, continuing", .{self.config.slot_name});
+                        return .{ .already_existed = true };
+                    },
+                    else => return err,
+                }
+            };
+
+            log.info("replication slot '{s}' ready", .{self.config.slot_name});
+            return .{};
+        }
     }
 
     /// Start streaming WAL changes from the given LSN position.

@@ -99,6 +99,13 @@ pub const Config = struct {
     // null = no exclusions (default).
     exclude_columns: ?[]const u8 = null,
 
+    // Initial snapshot: when true and a NEW replication slot is created,
+    // capture all existing rows in tracked tables as CREATE changes using
+    // PostgreSQL's EXPORT_SNAPSHOT mechanism. This ensures no data is missed
+    // when adding Zemi to an existing database. The snapshot is only taken
+    // once (on first slot creation). Default false.
+    initial_snapshot: bool = false,
+
     /// Returns the effective destination host (falls back to source).
     pub fn getDestHost(self: Config) []const u8 {
         return self.dest_db_host orelse self.db_host;
@@ -340,6 +347,12 @@ pub const Config = struct {
             if (v.len > 0) config.exclude_columns = v;
         }
 
+        if (std.posix.getenv("INITIAL_SNAPSHOT")) |v| {
+            if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "yes")) {
+                config.initial_snapshot = true;
+            }
+        }
+
         return config;
     }
 
@@ -485,6 +498,9 @@ pub const Config = struct {
         }
         if (self.exclude_columns) |ec| {
             log.info("config: exclude_columns={s}", .{ec});
+        }
+        if (self.initial_snapshot) {
+            log.info("config: initial_snapshot=true", .{});
         }
         if (self.health_port) |port| {
             log.info("config: health_port={d}", .{port});

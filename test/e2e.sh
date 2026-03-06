@@ -41,6 +41,18 @@ bold()  { printf "\033[1m%s\033[0m" "$1"; }
 
 log() { echo "--- $*"; }
 
+# Force-drop a replication slot by first terminating any active walsender.
+# pg_drop_replication_slot blocks indefinitely if the slot is active, and
+# statement_timeout does not apply to it. We must kill the walsender first.
+# Usage: drop_slot <psql_cmd> <slot_name>
+drop_slot() {
+    local psql_cmd="$1" slot_name="$2"
+    # Terminate any walsender backend using this slot
+    PGPASSWORD="$DB_PASSWORD" $psql_cmd -c "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = '$slot_name' AND active_pid IS NOT NULL;" 2>/dev/null || true
+    sleep 0.5
+    PGPASSWORD="$DB_PASSWORD" $psql_cmd -c "SELECT pg_drop_replication_slot('$slot_name');" 2>/dev/null || true
+}
+
 cleanup() {
     log "Cleaning up..."
     if [ -n "$ZEMI_PID" ] && kill -0 "$ZEMI_PID" 2>/dev/null; then
@@ -48,9 +60,9 @@ cleanup() {
         wait "$ZEMI_PID" 2>/dev/null || true
     fi
     # Drop replication slot and publication (best effort)
-    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('$SLOT_NAME');" 2>/dev/null || true
-    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('zemi_filter_test');" 2>/dev/null || true
-    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('zemi_metrics_test');" 2>/dev/null || true
+    drop_slot "$PSQL" "$SLOT_NAME"
+    drop_slot "$PSQL" "zemi_filter_test"
+    drop_slot "$PSQL" "zemi_metrics_test"
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $PUBLICATION_NAME;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS zemi_filter_pub;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS zemi_metrics_pub;" 2>/dev/null || true
@@ -167,7 +179,7 @@ log "Setting up test schema..."
 query "DROP TABLE IF EXISTS changes CASCADE;"
 query "DROP TABLE IF EXISTS test_users CASCADE;"
 query "DROP TABLE IF EXISTS test_orders CASCADE;"
-PGPASSWORD="$DB_PASSWORD" $PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('$SLOT_NAME');" 2>/dev/null || true
+drop_slot "$PSQL" "$SLOT_NAME"
 PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $PUBLICATION_NAME;" 2>/dev/null || true
 
 query "CREATE TABLE test_users (
@@ -465,7 +477,7 @@ cleanup_test_teardown() {
         wait "$CLEANUP_ZEMI_PID" 2>/dev/null || true
     fi
     # Best-effort cleanup in case the test fails
-    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('$CLEANUP_SLOT');" 2>/dev/null || true
+    drop_slot "$PSQL" "$CLEANUP_SLOT"
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $CLEANUP_PUB;" 2>/dev/null || true
 }
 
@@ -530,7 +542,7 @@ scram_cleanup() {
         kill "$SCRAM_ZEMI_PID" 2>/dev/null || true
         wait "$SCRAM_ZEMI_PID" 2>/dev/null || true
     fi
-    PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('zemi_scram_test');" 2>/dev/null || true
+    drop_slot "$SCRAM_PSQL" "zemi_scram_test"
     PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -c "DROP PUBLICATION IF EXISTS zemi_scram_pub;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -c "DROP TABLE IF EXISTS scram_test_items CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SCRAM_PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
@@ -617,9 +629,9 @@ ssl_cleanup() {
         kill "$SSL_ZEMI_PID" 2>/dev/null || true
         wait "$SSL_ZEMI_PID" 2>/dev/null || true
     fi
-    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('zemi_ssl_test');" 2>/dev/null || true
-    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('zemi_ssl_verify');" 2>/dev/null || true
-    PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('zemi_ssl_full');" 2>/dev/null || true
+    drop_slot "$SSL_PSQL" "zemi_ssl_test"
+    drop_slot "$SSL_PSQL" "zemi_ssl_verify"
+    drop_slot "$SSL_PSQL" "zemi_ssl_full"
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP PUBLICATION IF EXISTS zemi_ssl_pub;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP TABLE IF EXISTS ssl_test_items CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true
@@ -700,7 +712,7 @@ if [ "$SSL_AVAILABLE" = true ]; then
         # pick up stale WAL events (DELETEs from cleanup) via the old slot position.
         # Wait briefly for PostgreSQL to fully release the slot after Zemi exits.
         sleep 1
-        PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('zemi_ssl_test');" 2>/dev/null || true
+        drop_slot "$SSL_PSQL" "zemi_ssl_test"
 
         # --- Test 13b: sslmode=verify-ca with root cert ---
         echo "  $(bold "13b: sslmode=verify-ca")"
@@ -768,7 +780,7 @@ if [ "$SSL_AVAILABLE" = true ]; then
 
             # Drop the verify-ca slot before starting verify-full
             sleep 1
-            PGPASSWORD="$DB_PASSWORD" $SSL_PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('zemi_ssl_verify');" 2>/dev/null || true
+            drop_slot "$SSL_PSQL" "zemi_ssl_verify"
 
             # Clean up changes from 13b
             ssl_query "DELETE FROM changes;" 2>/dev/null || true
@@ -842,7 +854,7 @@ filter_cleanup() {
         kill "$FILTER_ZEMI_PID" 2>/dev/null || true
         wait "$FILTER_ZEMI_PID" 2>/dev/null || true
     fi
-    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('$FILTER_SLOT');" 2>/dev/null || true
+    drop_slot "$PSQL" "$FILTER_SLOT"
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $FILTER_PUB;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_tracked CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS filter_ignored CASCADE;" 2>/dev/null || true
@@ -918,7 +930,7 @@ metrics_cleanup() {
         wait "$METRICS_ZEMI_PID" 2>/dev/null || true
         sleep 1
     fi
-    PGPASSWORD="$DB_PASSWORD" $PSQL -c "SET statement_timeout = '5s'; SELECT pg_drop_replication_slot('$METRICS_SLOT');" 2>/dev/null || true
+    drop_slot "$PSQL" "$METRICS_SLOT"
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP PUBLICATION IF EXISTS $METRICS_PUB;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS metrics_test CASCADE;" 2>/dev/null || true
     PGPASSWORD="$DB_PASSWORD" $PSQL -c "DROP TABLE IF EXISTS changes CASCADE;" 2>/dev/null || true

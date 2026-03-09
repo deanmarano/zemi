@@ -61,10 +61,6 @@ const config: Config = {
     image: "img/social-card.png",
     navbar: {
       title: "Zemi",
-      logo: {
-        alt: "Zemi Logo",
-        src: "img/logo.png",
-      },
       items: [
         {
           type: "docSidebar",

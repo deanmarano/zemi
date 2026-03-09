@@ -6,6 +6,8 @@ Zemi automatically tracks every database change (INSERT, UPDATE, DELETE, TRUNCAT
 
 Zemi replaces the original Bemi's multi-runtime architecture (Java/Debezium + Go/NATS + TypeScript/Node.js) with a **single statically-linked Zig binary** that directly implements the PostgreSQL logical replication protocol.
 
+> **Note:** Zemi is an independent open-source project and is not affiliated with, endorsed by, or connected to Bemi.io or BemiHQ in any way. It is a clean-room rewrite that originated as a fork of the open-source [BemiHQ/bemi-io](https://github.com/BemiHQ/bemi-io) codebase (SSPL-1.0 licensed).
+
 ## Benchmarks
 
 Real measurements comparing Zemi to the original Bemi, run automatically in CI on every push:

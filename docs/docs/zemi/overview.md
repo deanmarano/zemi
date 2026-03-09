@@ -8,6 +8,10 @@ slug: '/zemi'
 
 Zemi is a from-scratch rewrite of [Bemi](/) in [Zig](https://ziglang.org/). It replaces the original multi-runtime architecture (Java/Debezium + Go/NATS + TypeScript/Node.js) with a **single statically-linked binary** that directly implements the PostgreSQL logical replication protocol.
 
+:::note
+Zemi is an independent open-source project and is not affiliated with, endorsed by, or connected to Bemi.io or BemiHQ in any way. It is a clean-room rewrite that originated as a fork of the open-source [BemiHQ/bemi-io](https://github.com/BemiHQ/bemi-io) codebase (SSPL-1.0 licensed).
+:::
+
 Same functionality. Same `changes` table. Same ORM packages. **3,100x smaller.**
 
 ## At a Glance

@@ -359,9 +359,17 @@ pub const Connection = struct {
                 .parameter_status => {
                     // ParameterStatus: name\0 value\0
                     var reader = protocol.MessageReader.init(raw.payload);
-                    const name = reader.readString() catch continue;
-                    const value = reader.readString() catch continue;
-                    self.server_params.put(name, value) catch {};
+                    const name = reader.readString() catch {
+                        log.debug("malformed ParameterStatus message: could not read name", .{});
+                        continue;
+                    };
+                    const value = reader.readString() catch {
+                        log.debug("malformed ParameterStatus message: could not read value for {s}", .{name});
+                        continue;
+                    };
+                    self.server_params.put(name, value) catch {
+                        log.debug("failed to store ParameterStatus {s}={s}", .{ name, value });
+                    };
                 },
                 .backend_key_data => {
                     var reader = protocol.MessageReader.init(raw.payload);

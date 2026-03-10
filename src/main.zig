@@ -336,7 +336,7 @@ fn runReplicationLoop(allocator: std.mem.Allocator, config: Config, m: *Metrics)
                         Metrics.inc(&m.changes_filtered_total);
                         continue;
                     }
-                    filtered.append(change) catch {};
+                    try filtered.append(change);
                 }
 
                 if (filtered.items.len == 0) {

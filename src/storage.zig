@@ -278,7 +278,10 @@ pub const Storage = struct {
             try buf.appendSlice(", ");
 
             // position — LSN as bigint
-            const lsn_num = protocol.parseLsn(change.position) catch 0;
+            const lsn_num = protocol.parseLsn(change.position) catch |err| blk: {
+                log.warn("failed to parse LSN '{s}' for change in {s}.{s}: {}, using 0", .{ change.position, change.schema, change.table, err });
+                break :blk 0;
+            };
             var lsn_buf: [20]u8 = undefined;
             const lsn_str = std.fmt.bufPrint(&lsn_buf, "{d}", .{lsn_num}) catch unreachable;
             try buf.appendSlice(lsn_str);
